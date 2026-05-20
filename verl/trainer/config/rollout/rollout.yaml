@@ -247,6 +247,18 @@ agent:
     # Class name of the custom async server class (e.g. AsyncvLLMServer)
     name: null
 
+scalewob:
+  base_url: https://niumascript.com/scalewob-env
+  platform: mobile
+  headless: true
+  screenshot_quality: low
+  target_image_hw: [1024, 474]
+  coord_scale: 1000
+  reset_retries: 3
+  max_env_steps: 10
+  action_history_len: 4
+  anchor_hash_hw: [64, 64]
+
 # Checkpoint Engine config for update weights from trainer to rollout
 checkpoint_engine:
 

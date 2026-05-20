@@ -195,6 +195,8 @@ class RolloutConfig(BaseConfig):
 
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
+    scalewob: Optional[dict] = None
+
     trace: TraceConfig = field(default_factory=TraceConfig)
 
     multi_turn: MultiTurnConfig = field(default_factory=MultiTurnConfig)
