@@ -50,6 +50,8 @@ from verl.workers.rollout.vllm_rollout.utils import (
     SuppressSignalInThread,
     build_cli_args_from_config,
     get_vllm_max_lora_rank,
+    patch_qwen2_tokenizer_special_tokens_extended,
+    patch_qwen3_vl_text_config_tie_word_embeddings,
 )
 
 _VLLM_VERSION = version.parse(vllm.__version__)
@@ -212,6 +214,8 @@ class vLLMHttpServer:
             self._dp_rpc_port = dp_rpc_port
 
         # 1. setup vllm serve cli args
+        patch_qwen2_tokenizer_special_tokens_extended()
+        patch_qwen3_vl_text_config_tie_word_embeddings()
         engine_kwargs = self.config.get("engine_kwargs", {}).get("vllm", {}) or {}
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if self.config.get("limit_images", None):  # support for multi-image data

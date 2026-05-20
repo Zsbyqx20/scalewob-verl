@@ -39,6 +39,36 @@ VLLM_LORA_PATH = "simon_lora_path"
 VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
 
 
+def patch_qwen2_tokenizer_special_tokens_extended() -> None:
+    """Add a compatibility property expected by vLLM for Transformers 5.x Qwen2Tokenizer."""
+    try:
+        from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer
+    except ImportError:
+        return
+
+    if hasattr(Qwen2Tokenizer, "all_special_tokens_extended"):
+        return
+
+    @property
+    def all_special_tokens_extended(self):
+        return list(self.added_tokens_decoder.values())
+
+    Qwen2Tokenizer.all_special_tokens_extended = all_special_tokens_extended
+
+
+def patch_qwen3_vl_text_config_tie_word_embeddings() -> None:
+    """Add missing Qwen3VLTextConfig.tie_word_embeddings for vLLM's Qwen3-VL loader."""
+    try:
+        from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
+    except ImportError:
+        return
+
+    if hasattr(Qwen3VLTextConfig, "tie_word_embeddings"):
+        return
+
+    Qwen3VLTextConfig.tie_word_embeddings = False
+
+
 def set_death_signal():
     """Kill the current process when the parent process exits."""
     if platform.system() != "Linux":
@@ -118,6 +148,8 @@ class vLLMColocateWorkerExtension:
 
     def __new__(cls, **kwargs):
         set_death_signal()
+        patch_qwen2_tokenizer_special_tokens_extended()
+        patch_qwen3_vl_text_config_tie_word_embeddings()
 
         # 1. patch for Lora
         VLLMHijack.hijack()
