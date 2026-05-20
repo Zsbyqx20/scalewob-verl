@@ -187,6 +187,33 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.GIGPO:
+        required_non_tensor_keys = ("anchor_obs", "traj_uid", "active_masks", "rewards", "is_action_valid")
+        missing_keys = [key for key in required_non_tensor_keys if key not in data.non_tensor_batch]
+        if missing_keys:
+            raise ValueError(f"GiGPO requires non_tensor_batch keys: {missing_keys}")
+
+        gigpo_config = config.get("gigpo", {}) if config is not None else {}
+        advantages, returns = core_algos.compute_gigpo_outcome_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["index"],
+            anchor_obs=data.non_tensor_batch["anchor_obs"],
+            traj_uid=data.non_tensor_batch["traj_uid"],
+            rewards=data.non_tensor_batch["rewards"],
+            is_action_valid=data.non_tensor_batch["is_action_valid"],
+            gamma=gamma,
+            step_advantage_w=gigpo_config.get("step_advantage_w", 1.0),
+            mode=gigpo_config.get("mode", "mean_std_norm"),
+            enable_similarity=gigpo_config.get("enable_similarity", False),
+            similarity_thresh=gigpo_config.get("similarity_thresh", 0.95),
+            invalid_action_penalty_coef=gigpo_config.get("invalid_action_penalty_coef", 0.1),
+        )
+        active_masks = torch.as_tensor(data.non_tensor_batch["active_masks"], device=advantages.device).reshape(-1, 1)
+        advantages = advantages * active_masks
+        returns = returns * active_masks
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)

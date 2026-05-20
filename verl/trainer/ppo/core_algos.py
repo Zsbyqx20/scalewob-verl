@@ -105,6 +105,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    GIGPO = "gigpo"
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
     GDPO = "gdpo"
@@ -329,6 +330,100 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+def _normalize_group_scores(
+    scores: torch.Tensor,
+    group_keys: list[Any],
+    *,
+    epsilon: float = 1e-6,
+    mode: str = "mean_std_norm",
+) -> torch.Tensor:
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    for i, key in enumerate(group_keys):
+        id2score[key].append(scores[i])
+    for key, group_scores in id2score.items():
+        if len(group_scores) == 1:
+            id2mean[key] = torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
+            id2std[key] = torch.tensor(1.0, device=scores.device, dtype=scores.dtype)
+        else:
+            scores_tensor = torch.stack(group_scores)
+            id2mean[key] = torch.mean(scores_tensor)
+            id2std[key] = torch.std(scores_tensor)
+
+    normalized = torch.empty_like(scores)
+    for i, key in enumerate(group_keys):
+        centered = scores[i] - id2mean[key]
+        if mode == "mean_std_norm":
+            normalized[i] = centered / (id2std[key] + epsilon)
+        elif mode == "mean_norm":
+            normalized[i] = centered
+        else:
+            raise ValueError(f"Unsupported GiGPO normalization mode: {mode}")
+    return normalized
+
+
+def compute_step_discounted_returns(
+    rewards: np.ndarray | torch.Tensor, traj_uid: np.ndarray, gamma: float
+) -> torch.Tensor:
+    """Compute discounted returns for each trajectory in possibly mixed batch order."""
+    rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32)
+    if rewards_tensor.dim() != 1:
+        rewards_tensor = rewards_tensor.reshape(-1)
+
+    returns = torch.zeros_like(rewards_tensor)
+    uid_to_indices = defaultdict(list)
+    for i, uid in enumerate(traj_uid):
+        uid_to_indices[uid].append(i)
+
+    for indices in uid_to_indices.values():
+        running_return = torch.tensor(0.0, dtype=rewards_tensor.dtype, device=rewards_tensor.device)
+        for i in reversed(indices):
+            running_return = rewards_tensor[i] + gamma * running_return
+            returns[i] = running_return
+    return returns
+
+
+@register_adv_est(AdvantageEstimator.GIGPO)
+def compute_gigpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    anchor_obs: np.ndarray,
+    traj_uid: np.ndarray,
+    rewards: np.ndarray,
+    is_action_valid: np.ndarray,
+    gamma: float = 1.0,
+    step_advantage_w: float = 1.0,
+    mode: str = "mean_std_norm",
+    invalid_action_penalty_coef: float = 0.1,
+    epsilon: float = 1e-6,
+    enable_similarity: bool = False,
+    similarity_thresh: float = 0.95,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute GiGPO joint outcome and step-level grouped advantage."""
+    if enable_similarity:
+        raise NotImplementedError("GiGPO similarity grouping is disabled in this implementation")
+
+    with torch.no_grad():
+        device = token_level_rewards.device
+        dtype = token_level_rewards.dtype
+        episode_scores = token_level_rewards.sum(dim=-1)
+        episode_adv = _normalize_group_scores(episode_scores, list(index), epsilon=epsilon, mode=mode)
+
+        step_scores = compute_step_discounted_returns(rewards, traj_uid, gamma).to(device=device, dtype=dtype)
+        valid_tensor = torch.as_tensor(is_action_valid, device=device, dtype=dtype).reshape(-1)
+        step_scores = step_scores - invalid_action_penalty_coef * (1.0 - valid_tensor)
+        step_group_keys = [(index[i], anchor_obs[i]) for i in range(len(index))]
+        step_adv = _normalize_group_scores(step_scores, step_group_keys, epsilon=epsilon, mode=mode)
+
+        advantages = (episode_adv + step_advantage_w * step_adv).unsqueeze(-1) * response_mask
+        returns = advantages.clone()
+    return advantages, returns
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)

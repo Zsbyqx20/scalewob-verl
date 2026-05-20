@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = ["AlgoConfig", "FilterGroupsConfig", "GiGPOConfig", "KLControlConfig", "RolloutCorrectionConfig"]
 
 
 @dataclass
@@ -54,6 +54,17 @@ class FilterGroupsConfig(BaseConfig):
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+
+
+@dataclass
+class GiGPOConfig(BaseConfig):
+    """Configuration for GiGPO step-level grouped advantage."""
+
+    step_advantage_w: float = 1.0
+    mode: str = "mean_std_norm"
+    enable_similarity: bool = False
+    similarity_thresh: float = 0.95
+    invalid_action_penalty_coef: float = 0.1
 
 
 @dataclass
@@ -609,6 +620,7 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    gigpo: GiGPOConfig = field(default_factory=GiGPOConfig)
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

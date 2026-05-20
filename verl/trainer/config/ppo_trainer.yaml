@@ -75,6 +75,15 @@ algorithm:
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 
+  # GiGPO step-level grouped advantage settings
+  gigpo:
+    _target_: verl.trainer.config.GiGPOConfig
+    step_advantage_w: 1.0
+    mode: mean_std_norm
+    enable_similarity: false
+    similarity_thresh: 0.95
+    invalid_action_penalty_coef: 0.1
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 
