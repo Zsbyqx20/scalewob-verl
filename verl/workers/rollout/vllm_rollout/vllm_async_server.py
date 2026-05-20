@@ -219,7 +219,7 @@ class vLLMHttpServer:
         engine_kwargs = self.config.get("engine_kwargs", {}).get("vllm", {}) or {}
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if self.config.get("limit_images", None):  # support for multi-image data
-            engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
+            engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images"), "video": 0}
         if self.config.cudagraph_capture_sizes:
             engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
@@ -309,7 +309,7 @@ class vLLMHttpServer:
         args = {
             "dtype": self.config.dtype,
             "load_format": self.config.load_format,
-            "skip_tokenizer_init": False,
+            "skip_tokenizer_init": self.config.skip_tokenizer_init,
             "distributed_executor_backend": "mp",
             "worker_extension_cls": "verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension",
             "trust_remote_code": self.model_config.trust_remote_code,

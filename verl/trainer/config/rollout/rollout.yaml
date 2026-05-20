@@ -247,6 +247,8 @@ agent:
     # Class name of the custom async server class (e.g. AsyncvLLMServer)
     name: null
 
+limit_images: null
+
 scalewob:
   base_url: https://niumascript.com/scalewob-env
   platform: mobile
