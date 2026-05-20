@@ -105,6 +105,9 @@ class ScaleWoBAgentLoop(AgentLoopBase):
                     "extra_info": extra_info,
                     "turn_scores": [],
                     "tool_rewards": [],
+                    "thought": parsed.thought,
+                    "raw_action": parsed.raw_action,
+                    "normalized_action": parsed.action,
                 }
                 if parsed.error:
                     extra_fields["action_parse_error"] = parsed.error
@@ -132,7 +135,15 @@ class ScaleWoBAgentLoop(AgentLoopBase):
                     )
                 )
 
-                action_history.append({"action": parsed.action, "valid": parsed.is_action_valid, "reward": env_reward})
+                action_history.append(
+                    {
+                        "thought": parsed.thought,
+                        "raw_action": parsed.raw_action,
+                        "action": parsed.action,
+                        "valid": parsed.is_action_valid,
+                        "reward": env_reward,
+                    }
+                )
                 finished = parsed.action["action"] == "finish"
                 if finished or done:
                     break

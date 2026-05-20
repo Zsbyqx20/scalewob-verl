@@ -39,6 +39,9 @@ def _internal(step_id: int, reward_score: float, index: int = 5, traj_uid: str =
             "active_masks": 1,
             "rewards": 0.25,
             "is_action_valid": 1,
+            "thought": "Tap the target.",
+            "raw_action": "device.click(100, 400)",
+            "normalized_action": {"action": "tap", "x": 100, "y": 400},
             "data_source": "scalewob",
             "raw_prompt": [{"role": "user", "content": "x"}],
         },
@@ -62,6 +65,16 @@ def test_flattened_agent_loop_outputs_are_flattened_to_dataproto():
     assert out.meta_info["rollout_flattened_steps"] is True
     assert out.non_tensor_batch["index"].tolist() == [5, 5, 6]
     assert out.non_tensor_batch["step_id"].tolist() == [0, 1, 0]
+    assert out.non_tensor_batch["traj_uid"].tolist() == ["traj-a", "traj-a", "traj-b"]
+    assert out.non_tensor_batch["anchor_obs"].tolist() == ["hash-0", "hash-1", "hash-0"]
+    assert out.non_tensor_batch["rewards"].tolist() == [0.25, 0.25, 0.25]
+    assert out.non_tensor_batch["is_action_valid"].tolist() == [1, 1, 1]
+    assert out.non_tensor_batch["active_masks"].tolist() == [1, 1, 1]
+    assert out.non_tensor_batch["raw_action"].tolist() == [
+        "device.click(100, 400)",
+        "device.click(100, 400)",
+        "device.click(100, 400)",
+    ]
     assert "rm_scores" in out.batch
     assert len(out.non_tensor_batch["multi_modal_inputs"]) == 3
 

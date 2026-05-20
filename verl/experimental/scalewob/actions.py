@@ -3,6 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import ast
 import json
 import re
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ ACTION_ALIASES = {
     "pause": "wait",
 }
 VALID_ACTIONS = {"tap", "input_text", "swipe", "wait", "finish"}
+SUPPORTED_DEVICE_METHODS = {"click", "type", "swipe", "wait", "end_task"}
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,8 @@ class ParsedAction:
     action: dict[str, Any]
     is_action_valid: int
     error: str | None = None
+    thought: str | None = None
+    raw_action: str | None = None
 
 
 def _strip_markdown_fence(text: str) -> str:
@@ -34,8 +38,14 @@ def _strip_markdown_fence(text: str) -> str:
     return fence.group(1).strip() if fence else stripped
 
 
-def _fallback_wait(error: str) -> ParsedAction:
-    return ParsedAction(action={"action": "wait"}, is_action_valid=0, error=error)
+def _fallback_wait(error: str, *, thought: str | None = None, raw_action: str | None = None) -> ParsedAction:
+    return ParsedAction(
+        action={"action": "wait"},
+        is_action_valid=0,
+        error=error,
+        thought=thought,
+        raw_action=raw_action,
+    )
 
 
 def _clamp_coord(value: Any, coord_scale: int) -> int:
@@ -46,8 +56,96 @@ def _clamp_coord(value: Any, coord_scale: int) -> int:
     return int(max(0, min(coord_scale, round(number))))
 
 
-def parse_action(text: str, coord_scale: int = 1000) -> ParsedAction:
-    """Parse a model JSON action and project aliases/coordinates into ScaleWoB's action space."""
+def _extract_thought(text: str) -> str | None:
+    match = re.search(r"Thought:\s*(.*?)(?=\n\s*(?:Action:|```)|$)", text, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    thought = match.group(1).strip()
+    return thought or None
+
+
+def _extract_sft_action_code(text: str) -> str | None:
+    inline = re.search(r"^\s*Action:\s*`?([^`\n]+)`?\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
+    if inline:
+        return inline.group(1).strip()
+
+    for fence in re.finditer(r"```(?:python)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL):
+        code = fence.group(1).strip()
+        action_line = re.search(r"device\.[A-Za-z_][A-Za-z0-9_]*\s*\(.*\)", code, flags=re.DOTALL)
+        if action_line:
+            return action_line.group(0).strip()
+    return None
+
+
+def _literal(node: ast.AST) -> Any:
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, SyntaxError):
+        raise ValueError("action_argument_not_literal") from None
+
+
+def _coord_pair(node: ast.AST) -> tuple[Any, Any]:
+    value = _literal(node)
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        raise ValueError("coordinate_pair_required")
+    return value[0], value[1]
+
+
+def _parse_device_action(code: str, coord_scale: int) -> dict[str, Any]:
+    try:
+        parsed = ast.parse(code, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"invalid_device_action_syntax: {exc}") from None
+
+    call = parsed.body
+    if not isinstance(call, ast.Call):
+        raise ValueError("device_action_not_call")
+    func = call.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "device"
+        and isinstance(func.attr, str)
+    ):
+        raise ValueError("device_action_must_call_device_method")
+
+    method = func.attr
+    if method not in SUPPORTED_DEVICE_METHODS:
+        raise ValueError(f"unsupported_device_method: {method}")
+
+    if method == "click":
+        if len(call.args) < 2:
+            raise ValueError("device_click_requires_x_y")
+        return {
+            "action": "tap",
+            "x": _clamp_coord(_literal(call.args[0]), coord_scale),
+            "y": _clamp_coord(_literal(call.args[1]), coord_scale),
+        }
+    if method == "type":
+        if not call.args:
+            raise ValueError("device_type_requires_content")
+        return {"action": "input_text", "text": str(_literal(call.args[0]))}
+    if method == "swipe":
+        if len(call.args) < 2:
+            raise ValueError("device_swipe_requires_start_end")
+        x1, y1 = _coord_pair(call.args[0])
+        x2, y2 = _coord_pair(call.args[1])
+        return {
+            "action": "swipe",
+            "x1": _clamp_coord(x1, coord_scale),
+            "y1": _clamp_coord(y1, coord_scale),
+            "x2": _clamp_coord(x2, coord_scale),
+            "y2": _clamp_coord(y2, coord_scale),
+        }
+    if method == "wait":
+        return {"action": "wait"}
+    if method == "end_task":
+        return {"action": "finish"}
+
+    raise ValueError(f"unsupported_device_method: {method}")
+
+
+def _parse_json_action(text: str, coord_scale: int) -> ParsedAction:
     try:
         payload = json.loads(_strip_markdown_fence(text))
     except json.JSONDecodeError as exc:
@@ -82,4 +180,34 @@ def parse_action(text: str, coord_scale: int = 1000) -> ParsedAction:
     else:
         projected = {"action": action_name}
 
-    return ParsedAction(action=projected, is_action_valid=1)
+    return ParsedAction(action=projected, is_action_valid=1, raw_action=json.dumps(payload, ensure_ascii=False))
+
+
+def parse_action(text: str, coord_scale: int = 1000) -> ParsedAction:
+    """Parse SFT device-use output, with legacy JSON actions as a compatibility fallback."""
+    thought = _extract_thought(text)
+    raw_action = _extract_sft_action_code(text)
+    if raw_action is not None:
+        try:
+            return ParsedAction(
+                action=_parse_device_action(raw_action, coord_scale),
+                is_action_valid=1,
+                thought=thought,
+                raw_action=raw_action,
+            )
+        except ValueError as exc:
+            return _fallback_wait(str(exc), thought=thought, raw_action=raw_action)
+
+    if re.search(r"\b(?:Thought|Action):|device\.", text, flags=re.IGNORECASE):
+        return _fallback_wait("missing_device_action", thought=thought)
+
+    parsed = _parse_json_action(text, coord_scale)
+    if parsed.thought is None and thought is not None:
+        return ParsedAction(
+            action=parsed.action,
+            is_action_valid=parsed.is_action_valid,
+            error=parsed.error,
+            thought=thought,
+            raw_action=parsed.raw_action,
+        )
+    return parsed
