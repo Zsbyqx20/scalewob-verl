@@ -106,9 +106,21 @@ class ScaleWoBBrowser:
                 return {"observation": None, "reward": 0.0, "done": False, "info": {}}
             except Exception as exc:
                 return invalid_step(str(exc))
+        if action_name in {"long_press", "long_click"}:
+            try:
+                automation.long_press(int(action.get("x", 0)), int(action.get("y", 0)))
+                return {"observation": None, "reward": 0.0, "done": False, "info": {}}
+            except Exception as exc:
+                return invalid_step(str(exc))
         if action_name in {"input_text", "type", "text", "input"}:
             try:
                 automation.type(str(action.get("text", "")))
+                return {"observation": None, "reward": 0.0, "done": False, "info": {}}
+            except Exception as exc:
+                return invalid_step(str(exc))
+        if action_name in {"press_enter", "enter"}:
+            try:
+                automation.press_enter()
                 return {"observation": None, "reward": 0.0, "done": False, "info": {}}
             except Exception as exc:
                 return invalid_step(str(exc))
@@ -127,7 +139,10 @@ class ScaleWoBBrowser:
             return {"observation": None, "reward": 0.0, "done": False, "info": {}}
         if action_name == "finish":
             try:
-                result = automation.finish_evaluation(task_id=self._task_id)
+                params = action.get("params")
+                if params is not None and not isinstance(params, dict):
+                    return invalid_step("finish_params_must_be_object")
+                result = automation.finish_evaluation(task_id=self._task_id, params=params)
                 reward = 1.0 if result.get("success") else float(result.get("reward", 0.0) or 0.0)
                 return {"observation": None, "reward": reward, "done": True, "info": result}
             except Exception as exc:
