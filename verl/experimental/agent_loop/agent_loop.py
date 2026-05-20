@@ -174,6 +174,33 @@ class AgentLoopMetrics(BaseModel):
     num_preempted: int = -1  # -1 means not available
 
 
+class AgentLoopStepOutput(BaseModel):
+    """One flattened training row emitted by an agent loop."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    prompt_ids: list[int]
+    """Prompt token ids for this step."""
+    response_ids: list[int]
+    """Response token ids for this step."""
+    response_mask: list[int]
+    """Response mask, 1 for LLM generated token, 0 for tool response token."""
+    response_logprobs: Optional[list[float]] = None
+    """Log probabilities for the response tokens."""
+    routed_experts: Optional[Any] = None
+    """Routed experts for the total tokens."""
+    multi_modal_data: Optional[dict[str, Any]] = None
+    """Multi-modal data for this step."""
+    reward_score: Optional[float] = None
+    """Episode-level reward score for this step row."""
+    num_turns: int = 0
+    """Number of chat turns represented by this step row."""
+    metrics: AgentLoopMetrics
+    """Auxiliary performance metrics."""
+    extra_fields: dict[str, Any] = {}
+    """Extra fields for dynamic addition."""
+
+
 class AgentLoopOutput(BaseModel):
     """Agent loop output."""
 
@@ -197,6 +224,8 @@ class AgentLoopOutput(BaseModel):
     """Auxiliary performance metrics"""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
+    step_outputs: Optional[list[AgentLoopStepOutput]] = None
+    """Optional flattened per-step outputs. When set, each step becomes one training row."""
 
 
 class _InternalAgentLoopOutput(AgentLoopOutput):
@@ -568,6 +597,9 @@ class AgentLoopWorker:
 
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
+        if getattr(output, "step_outputs", None) is not None:
+            return await self._agent_loop_step_postprocess(output, **kwargs)
+
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
@@ -690,6 +722,17 @@ class AgentLoopWorker:
             extra_fields=output.extra_fields,
         )
 
+    async def _agent_loop_step_postprocess(self, output, **kwargs) -> list[_InternalAgentLoopOutput]:
+        """Postprocess flattened step rows from one agent-loop trajectory."""
+        if not output.step_outputs:
+            raise ValueError("AgentLoopOutput.step_outputs must contain at least one step")
+
+        processed_steps = []
+        for step_output in output.step_outputs:
+            step_output.extra_fields.setdefault("raw_prompt", kwargs["raw_prompt"])
+            processed_steps.append(await self._agent_loop_postprocess(step_output, **kwargs))
+        return processed_steps
+
     def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image and video."""
         multi_modal_inputs = {}
@@ -788,10 +831,23 @@ class AgentLoopWorker:
 
     def _postprocess(
         self,
-        inputs: list[_InternalAgentLoopOutput],
+        inputs: list[_InternalAgentLoopOutput | list[_InternalAgentLoopOutput]],
         input_non_tensor_batch: dict | None = None,
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
+        flattened_inputs = []
+        flattened_source_indices = []
+        rollout_flattened_steps = False
+        for source_index, input_item in enumerate(inputs):
+            if isinstance(input_item, list):
+                rollout_flattened_steps = True
+                flattened_inputs.extend(input_item)
+                flattened_source_indices.extend([source_index] * len(input_item))
+            else:
+                flattened_inputs.append(input_item)
+                flattened_source_indices.append(source_index)
+        inputs = flattened_inputs
+
         # Convert lists back to tensors and stack them to create a batch.
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
         response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
@@ -831,7 +887,11 @@ class AgentLoopWorker:
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
-            non_tensor_batch.update(input_non_tensor_batch)
+            if rollout_flattened_steps:
+                for key, values in input_non_tensor_batch.items():
+                    non_tensor_batch[key] = np.array([values[i] for i in flattened_source_indices], dtype=object)
+            else:
+                non_tensor_batch.update(input_non_tensor_batch)
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
@@ -869,6 +929,8 @@ class AgentLoopWorker:
             meta_info = {"metrics": metrics, "reward_extra_keys": reward_extra_keys}
         else:
             meta_info = {"metrics": metrics}
+        if rollout_flattened_steps:
+            meta_info["rollout_flattened_steps"] = True
 
         return DataProto(
             batch=batch,
