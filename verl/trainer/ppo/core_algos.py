@@ -370,7 +370,10 @@ def compute_step_discounted_returns(
     rewards: np.ndarray | torch.Tensor, traj_uid: np.ndarray, gamma: float
 ) -> torch.Tensor:
     """Compute discounted returns for each trajectory in possibly mixed batch order."""
-    rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32)
+    if isinstance(rewards, torch.Tensor):
+        rewards_tensor = rewards.to(dtype=torch.float32)
+    else:
+        rewards_tensor = torch.as_tensor(np.asarray(rewards, dtype=np.float32), dtype=torch.float32)
     if rewards_tensor.dim() != 1:
         rewards_tensor = rewards_tensor.reshape(-1)
 
@@ -416,7 +419,11 @@ def compute_gigpo_outcome_advantage(
         episode_adv = _normalize_group_scores(episode_scores, list(index), epsilon=epsilon, mode=mode)
 
         step_scores = compute_step_discounted_returns(rewards, traj_uid, gamma).to(device=device, dtype=dtype)
-        valid_tensor = torch.as_tensor(is_action_valid, device=device, dtype=dtype).reshape(-1)
+        valid_tensor = torch.as_tensor(
+            np.asarray(is_action_valid, dtype=np.float32),
+            device=device,
+            dtype=dtype,
+        ).reshape(-1)
         step_scores = step_scores - invalid_action_penalty_coef * (1.0 - valid_tensor)
         step_group_keys = [(index[i], anchor_obs[i]) for i in range(len(index))]
         step_adv = _normalize_group_scores(step_scores, step_group_keys, epsilon=epsilon, mode=mode)

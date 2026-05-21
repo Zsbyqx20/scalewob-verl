@@ -209,7 +209,11 @@ def compute_advantage(
             similarity_thresh=gigpo_config.get("similarity_thresh", 0.95),
             invalid_action_penalty_coef=gigpo_config.get("invalid_action_penalty_coef", 0.1),
         )
-        active_masks = torch.as_tensor(data.non_tensor_batch["active_masks"], device=advantages.device).reshape(-1, 1)
+        active_masks = torch.as_tensor(
+            np.asarray(data.non_tensor_batch["active_masks"], dtype=np.float32),
+            device=advantages.device,
+            dtype=advantages.dtype,
+        ).reshape(-1, 1)
         advantages = advantages * active_masks
         returns = returns * active_masks
         data.batch["advantages"] = advantages
@@ -1022,7 +1026,7 @@ class RayPPOTrainer:
             if self.use_critic:
                 self.critic_wg.stop_profile()
 
-    def _get_dp_size(self, worker_group, role: str) -> int:
+    def _get_dp_size(self, worker_group, role: str | tuple[str, ...]) -> int:
         """Get data parallel size from worker group dispatch info.
 
         This method retrieves the data parallel size by querying the dispatch info
@@ -1035,12 +1039,45 @@ class RayPPOTrainer:
         Returns:
             The data parallel size (number of DP ranks).
         """
-        if role not in worker_group._dispatch_info:
-            dp_rank_mapping = worker_group._query_dispatch_info(role)
-            worker_group._dispatch_info[role] = dp_rank_mapping
-        else:
-            dp_rank_mapping = worker_group._dispatch_info[role]
-        return max(dp_rank_mapping) + 1
+        roles = (role,) if isinstance(role, str) else role
+        last_error = None
+        for mesh_name in roles:
+            try:
+                if mesh_name not in worker_group._dispatch_info:
+                    dp_rank_mapping = worker_group._query_dispatch_info(mesh_name)
+                    worker_group._dispatch_info[mesh_name] = dp_rank_mapping
+                else:
+                    dp_rank_mapping = worker_group._dispatch_info[mesh_name]
+                return max(dp_rank_mapping) + 1
+            except Exception as exc:
+                last_error = exc
+        raise last_error
+
+    def _pad_flattened_batch_for_dp(
+        self,
+        batch: DataProto,
+        worker_group,
+        role: str | tuple[str, ...],
+        *,
+        zero_padding_loss: bool = False,
+    ) -> tuple[DataProto, int]:
+        """Pad variable-size flattened rollout batches for equal DP dispatch."""
+        if not batch.meta_info.get("rollout_flattened_steps", False):
+            return batch, 0
+
+        dp_size = self._get_dp_size(worker_group, role)
+        batch_padded, pad_size = pad_dataproto_to_divisor(batch, dp_size)
+        if pad_size == 0 or not zero_padding_loss:
+            return batch_padded, pad_size
+
+        for key in ("response_mask", "advantages", "returns"):
+            if key in batch_padded.batch.keys():
+                batch_padded.batch[key][-pad_size:] = 0
+        if "active_masks" in batch_padded.non_tensor_batch:
+            active_masks = np.asarray(batch_padded.non_tensor_batch["active_masks"], dtype=np.int64).copy()
+            active_masks[-pad_size:] = 0
+            batch_padded.non_tensor_batch["active_masks"] = active_masks
+        return batch_padded, pad_size
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens.
@@ -1113,6 +1150,7 @@ class RayPPOTrainer:
         metrics.update(global_balance_stats)
 
     def _compute_values(self, batch: DataProto) -> DataProto:
+        batch, pad_size = self._pad_flattened_batch_for_dp(batch, self.critic_wg, "critic")
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
             # step 2: convert from padding to nopadding
@@ -1127,9 +1165,13 @@ class RayPPOTrainer:
             values = DataProto.from_tensordict(values)
         else:
             values = self.critic_wg.compute_values(batch)
+        values = unpad_dataproto(values, pad_size)
         return values
 
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+        ref_worker_group = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
+        ref_role = ("actor", "ref")
+        batch, pad_size = self._pad_flattened_batch_for_dp(batch, ref_worker_group, ref_role)
         if self.use_legacy_worker_impl == "disable":
             # step 1: convert dataproto to tensordict.
             batch_td = batch.to_tensordict()
@@ -1154,9 +1196,11 @@ class RayPPOTrainer:
         else:
             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
 
+        ref_log_prob = unpad_dataproto(ref_log_prob, pad_size)
         return ref_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
+        batch, pad_size = self._pad_flattened_batch_for_dp(batch, self.actor_rollout_wg, "actor")
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
             # step 1: convert dataproto to tensordict.
@@ -1185,9 +1229,16 @@ class RayPPOTrainer:
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
+        old_log_prob = unpad_dataproto(old_log_prob, pad_size)
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
+        batch, _ = self._pad_flattened_batch_for_dp(
+            batch,
+            self.actor_rollout_wg,
+            "actor",
+            zero_padding_loss=True,
+        )
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
@@ -1225,6 +1276,12 @@ class RayPPOTrainer:
         return actor_output
 
     def _update_critic(self, batch: DataProto) -> DataProto:
+        batch, _ = self._pad_flattened_batch_for_dp(
+            batch,
+            self.critic_wg,
+            "critic",
+            zero_padding_loss=True,
+        )
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
             # step 2: convert from padding to no-padding
