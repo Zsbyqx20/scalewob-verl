@@ -7,6 +7,7 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopWorker,
     _InternalAgentLoopOutput,
 )
+from verl.experimental.scalewob.debug import log_scalewob_batch_debug, resolve_scalewob_debug_config
 
 
 def _internal(step_id: int, reward_score: float, index: int = 5, traj_uid: str = "traj-a") -> _InternalAgentLoopOutput:
@@ -70,11 +71,17 @@ def test_flattened_agent_loop_outputs_are_flattened_to_dataproto():
     assert out.non_tensor_batch["rewards"].tolist() == [0.25, 0.25, 0.25]
     assert out.non_tensor_batch["is_action_valid"].tolist() == [1, 1, 1]
     assert out.non_tensor_batch["active_masks"].tolist() == [1, 1, 1]
+    assert out.non_tensor_batch["step_id"].dtype == np.int64
+    assert out.non_tensor_batch["rewards"].dtype == np.float32
+    assert out.non_tensor_batch["is_action_valid"].dtype == np.int64
+    assert out.non_tensor_batch["active_masks"].dtype == np.int64
     assert out.non_tensor_batch["raw_action"].tolist() == [
         "device.click(100, 400)",
         "device.click(100, 400)",
         "device.click(100, 400)",
     ]
+    assert out.non_tensor_batch["action_exec_error"].tolist() == [None, None, None]
+    assert out.non_tensor_batch["action_parse_error"].tolist() == [None, None, None]
     assert "rm_scores" in out.batch
     assert len(out.non_tensor_batch["multi_modal_inputs"]) == 3
 
@@ -88,3 +95,40 @@ def test_agent_loop_step_output_type_exists_for_scale_wob_rows():
         extra_fields={"step_id": 0},
     )
     assert step.extra_fields["step_id"] == 0
+
+
+def test_scalewob_debug_writes_sampled_jsonl_from_flattened_batch(tmp_path):
+    dummy_worker = type("_DummyWorker", (), {"reward_loop_worker_handles": None})()
+    out = AgentLoopWorker._postprocess(
+        dummy_worker,
+        inputs=[[_internal(0, 1.0), _internal(1, 1.0)]],
+        input_non_tensor_batch={
+            "index": np.array([5], dtype=object),
+            "uid": np.array(["sample-5"], dtype=object),
+            "agent_name": np.array(["scalewob_agent"], dtype=object),
+        },
+    )
+    config = {
+        "actor_rollout_ref": {
+            "rollout": {
+                "scalewob": {
+                    "debug": {
+                        "enabled": True,
+                        "log_every_n_steps": 1,
+                        "save_jsonl": True,
+                        "output_dir": str(tmp_path),
+                    }
+                }
+            }
+        }
+    }
+
+    log_scalewob_batch_debug(out, config, global_step=3)
+
+    debug_config = resolve_scalewob_debug_config(config)
+    assert debug_config["enabled"] is True
+    jsonl_files = list((tmp_path / "global_step=3").glob("trajectory_*.jsonl"))
+    assert len(jsonl_files) == 1
+    lines = jsonl_files[0].read_text().strip().splitlines()
+    assert len(lines) == 2
+    assert '"raw_action": "device.click(100, 400)"' in lines[0]

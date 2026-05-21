@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import logging
 import os
 import uuid
 from collections import defaultdict
@@ -36,6 +37,12 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+from verl.experimental.scalewob.debug import (
+    compute_gigpo_debug_metrics,
+    log_scalewob_batch_debug,
+    resolve_scalewob_debug_config,
+    should_log_scalewob_debug,
+)
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -64,6 +71,9 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+module_logger = logging.getLogger(__file__)
+module_logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -1579,6 +1589,18 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        if self.config.algorithm.adv_estimator in ("gigpo", AdvantageEstimator.GIGPO):
+                            scalewob_debug_config = resolve_scalewob_debug_config(self.config)
+                            if should_log_scalewob_debug(scalewob_debug_config, self.global_steps):
+                                gigpo_debug_metrics = compute_gigpo_debug_metrics(batch)
+                                metrics.update(gigpo_debug_metrics)
+                                if gigpo_debug_metrics:
+                                    module_logger.warning(
+                                        "GiGPO debug metrics step=%s metrics=%s",
+                                        self.global_steps,
+                                        gigpo_debug_metrics,
+                                    )
+                                log_scalewob_batch_debug(batch, self.config, self.global_steps)
 
                     # update critic
                     if self.use_critic:

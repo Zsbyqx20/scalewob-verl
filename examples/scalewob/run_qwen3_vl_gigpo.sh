@@ -114,6 +114,8 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.scalewob.max_env_steps="${MAX_ENV_STEPS}" \
   actor_rollout_ref.rollout.scalewob.target_image_hw="[1024,474]" \
   +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=True \
+  actor_rollout_ref.rollout.scalewob.debug.enabled=true \
+  actor_rollout_ref.rollout.scalewob.debug.log_every_n_steps=1 \
   critic.enable=False \
   reward.reward_model.enable=False \
   trainer.critic_warmup=0 \

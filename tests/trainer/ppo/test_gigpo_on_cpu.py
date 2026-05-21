@@ -2,6 +2,7 @@ import numpy as np
 import torch
 
 from verl import DataProto
+from verl.experimental.scalewob.debug import compute_gigpo_debug_metrics
 from verl.trainer.ppo.core_algos import compute_step_discounted_returns
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, compute_advantage
 
@@ -63,6 +64,11 @@ def test_gigpo_advantages_are_token_shaped_masked_and_penalize_invalid_actions()
     assert torch.all(out.batch["advantages"][response_mask == 0] == 0)
     assert out.batch["advantages"][1, 0] < out.batch["advantages"][0, 0]
 
+    metrics = compute_gigpo_debug_metrics(out)
+    assert metrics["scalewob_debug/gigpo/invalid_action_count"] == 2.0
+    assert metrics["scalewob_debug/gigpo/unique_traj_uid_count"] == 4.0
+    assert metrics["scalewob_debug/gigpo/unique_step_group_count"] == 1.0
+
 
 def test_flattened_batch_padding_for_dp_zeroes_padding_loss_masks():
     data = DataProto.from_dict(
@@ -110,4 +116,5 @@ def test_get_dp_size_falls_back_across_dispatch_mesh_names():
     trainer = type("_DummyTrainer", (), {})()
 
     dp_size = RayPPOTrainer._get_dp_size(trainer, _WorkerGroup(), ("ref", "actor"))
+
     assert dp_size == 4

@@ -17,6 +17,7 @@ from verl.experimental.agent_loop.agent_loop import (
 )
 from verl.experimental.scalewob.actions import parse_action
 from verl.experimental.scalewob.browser import ScaleWoBBrowser, ScaleWoBBrowserConfig
+from verl.experimental.scalewob.debug import resolve_scalewob_debug_config
 from verl.experimental.scalewob.prompt import build_prompt_messages
 from verl.experimental.scalewob.vision import resize_screenshot, screenshot_hash
 from verl.utils.profiler import simple_timer
@@ -36,6 +37,7 @@ class ScaleWoBAgentLoop(AgentLoopBase):
         if rollout_scalewob is not None:
             rollout_scalewob = dict(rollout_scalewob)
         self.browser_config = ScaleWoBBrowserConfig.from_mapping(scalewob or rollout_scalewob)
+        self.debug_config = resolve_scalewob_debug_config(self.config, scalewob or rollout_scalewob)
         self.response_length = self.rollout_config.response_length
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -113,6 +115,21 @@ class ScaleWoBAgentLoop(AgentLoopBase):
                     extra_fields["action_parse_error"] = parsed.error
                 if step_info.get("error"):
                     extra_fields["action_exec_error"] = step_info["error"]
+                if self.debug_config["enabled"]:
+                    extra_fields.update(
+                        {
+                            "env_id": scalewob_info.get("env_id")
+                            or scalewob_info.get("environment_id")
+                            or scalewob_info.get("env"),
+                            "task_id": scalewob_info.get("task_id"),
+                            "task_description": description,
+                            "final_reward": final_reward,
+                        }
+                    )
+                    if self.debug_config["include_response"]:
+                        extra_fields["response_text"] = response_text
+                    if self.debug_config["include_prompt"]:
+                        extra_fields["prompt_messages"] = messages
 
                 step_outputs.append(
                     AgentLoopStepOutput(
@@ -154,6 +171,8 @@ class ScaleWoBAgentLoop(AgentLoopBase):
 
         for step_output in step_outputs:
             step_output.reward_score = final_reward
+            if self.debug_config["enabled"]:
+                step_output.extra_fields["final_reward"] = final_reward
         if not step_outputs:
             raise RuntimeError("ScaleWoB rollout produced no step outputs")
 

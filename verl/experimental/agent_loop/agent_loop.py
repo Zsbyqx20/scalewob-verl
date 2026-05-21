@@ -914,6 +914,14 @@ class AgentLoopWorker:
             "min_global_steps",
             "max_global_steps",
             "extras",
+            "action_parse_error",
+            "action_exec_error",
+            "env_id",
+            "task_id",
+            "task_description",
+            "final_reward",
+            "response_text",
+            "prompt_messages",
         }
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
         for key in all_keys:
@@ -922,6 +930,16 @@ class AgentLoopWorker:
             extra_fields[key] = temp_arr
 
         non_tensor_batch.update(extra_fields)
+        if rollout_flattened_steps:
+            numeric_extra_fields = {
+                "step_id": np.int64,
+                "active_masks": np.int64,
+                "rewards": np.float32,
+                "is_action_valid": np.int64,
+            }
+            for key, dtype in numeric_extra_fields.items():
+                if key in non_tensor_batch:
+                    non_tensor_batch[key] = np.asarray(non_tensor_batch[key], dtype=dtype)
 
         # Only include reward_extra_keys in meta_info if rm_scores is in batch
         # This avoids conflicts when reward_tensor is merged later in ray_trainer.py

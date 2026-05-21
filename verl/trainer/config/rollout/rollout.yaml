@@ -260,6 +260,15 @@ scalewob:
   max_env_steps: 10
   action_history_len: 4
   anchor_hash_hw: [64, 64]
+  debug:
+    enabled: false
+    log_every_n_steps: 10
+    max_trajectories: 2
+    max_steps_per_trajectory: 10
+    include_prompt: false
+    include_response: true
+    save_jsonl: false
+    output_dir: null
 
 # Checkpoint Engine config for update weights from trainer to rollout
 checkpoint_engine:
