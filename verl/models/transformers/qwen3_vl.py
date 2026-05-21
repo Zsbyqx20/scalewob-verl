@@ -15,17 +15,185 @@
 import functools
 import logging
 import os
+import types
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    BaseModelOutputWithDeepstackFeatures,
     Qwen3VLCausalLMOutputWithPast,
     Qwen3VLForConditionalGeneration,
 )
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _runtime_weight_device_dtype(
+    weight: torch.Tensor, runtime_device: torch.device | None = None
+) -> tuple[torch.device, torch.dtype]:
+    local_weight = getattr(weight, "_local_tensor", None)
+    if local_weight is not None:
+        return local_weight.device, local_weight.dtype
+    if runtime_device is not None:
+        return runtime_device, weight.dtype
+    if (
+        weight.device.type == "cpu"
+        and torch.cuda.is_available()
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        return torch.device("cuda", torch.cuda.current_device()), weight.dtype
+    return weight.device, weight.dtype
+
+
+def _get_visual_embeds(model: "Qwen3VLForConditionalGeneration", pixel_values: torch.Tensor, grid_thw: torch.Tensor):
+    model.visual._verl_runtime_device = pixel_values.device
+    visual_outputs = model.visual(pixel_values, grid_thw=grid_thw)
+    if hasattr(visual_outputs, "pooler_output"):
+        return visual_outputs.pooler_output, visual_outputs.deepstack_features
+    if isinstance(visual_outputs, tuple):
+        if len(visual_outputs) == 2:
+            return visual_outputs
+        if len(visual_outputs) >= 5:
+            return visual_outputs[1], visual_outputs[4]
+    raise TypeError(f"Unsupported Qwen3-VL visual output type: {type(visual_outputs)}")
+
+
+def _device_safe_embedding_forward(self, input: torch.Tensor) -> torch.Tensor:
+    return F.embedding(
+        input.to(self.weight.device),
+        self.weight,
+        self.padding_idx,
+        self.max_norm,
+        self.norm_type,
+        self.scale_grad_by_freq,
+        self.sparse,
+    )
+
+
+def _patch_device_safe_pos_embed(pos_embed: torch.nn.Embedding) -> None:
+    if getattr(pos_embed, "_verl_device_safe_forward", False):
+        return
+    pos_embed.forward = types.MethodType(_device_safe_embedding_forward, pos_embed)
+    pos_embed._verl_device_safe_forward = True
+
+
+def qwen3_vl_fast_pos_embed_interpolate(self, grid_thw):
+    grid_thw_list = grid_thw.detach().cpu().tolist()
+    grid_ts = [row[0] for row in grid_thw_list]
+    grid_hs = [row[1] for row in grid_thw_list]
+    grid_ws = [row[2] for row in grid_thw_list]
+    runtime_device = getattr(self, "_verl_runtime_device", None)
+    device, dtype = _runtime_weight_device_dtype(self.pos_embed.weight, runtime_device=runtime_device)
+
+    idx_list = [[] for _ in range(4)]
+    weight_list = [[] for _ in range(4)]
+
+    for _, h, w in grid_thw_list:
+        h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h, device=device)
+        w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w, device=device)
+
+        h_idxs_floor = h_idxs.int()
+        w_idxs_floor = w_idxs.int()
+        h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+        w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+
+        dh = h_idxs - h_idxs_floor
+        dw = w_idxs - w_idxs_floor
+
+        base_h = h_idxs_floor * self.num_grid_per_side
+        base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+
+        indices = [
+            (base_h[None].T + w_idxs_floor[None]).flatten(),
+            (base_h[None].T + w_idxs_ceil[None]).flatten(),
+            (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
+            (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
+        ]
+
+        weights = [
+            ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+            ((1 - dh)[None].T * dw[None]).flatten(),
+            (dh[None].T * (1 - dw)[None]).flatten(),
+            (dh[None].T * dw[None]).flatten(),
+        ]
+
+        for i in range(4):
+            idx_list[i].extend(indices[i].detach().cpu().tolist())
+            weight_list[i].extend(weights[i].detach().cpu().tolist())
+
+    runtime_device = getattr(self, "_verl_runtime_device", None)
+    device, dtype = _runtime_weight_device_dtype(self.pos_embed.weight, runtime_device=runtime_device)
+    idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
+    weight_tensor = torch.tensor(weight_list, dtype=dtype, device=device)
+    pos_embeds = self.pos_embed(idx_tensor)
+    weight_tensor = weight_tensor.to(pos_embeds.device)
+    pos_embeds = pos_embeds * weight_tensor[:, :, None]
+    patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+
+    patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws, strict=False)])
+
+    patch_pos_embeds_permute = []
+    merge_size = self.config.spatial_merge_size
+    for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws, strict=False):
+        pos_embed = pos_embed.repeat(t, 1)
+        pos_embed = (
+            pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
+            .permute(0, 1, 3, 2, 4, 5)
+            .flatten(0, 4)
+        )
+        patch_pos_embeds_permute.append(pos_embed)
+    return torch.cat(patch_pos_embeds_permute)
+
+
+def qwen3_vl_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs):
+    hidden_states = self.patch_embed(hidden_states)
+    runtime_device = hidden_states.device
+    self._verl_runtime_device = runtime_device
+    _patch_device_safe_pos_embed(self.pos_embed)
+    grid_thw = grid_thw.to(runtime_device)
+
+    pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+    hidden_states = hidden_states + pos_embeds.to(runtime_device)
+
+    rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+    seq_len, _ = hidden_states.size()
+    hidden_states = hidden_states.reshape(seq_len, -1)
+    rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1).to(runtime_device)
+    emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+    position_embeddings = (emb.cos(), emb.sin())
+
+    cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+        dim=0,
+        dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+    )
+    cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0).to(runtime_device)
+
+    deepstack_feature_lists = []
+    for layer_num, blk in enumerate(self.blocks):
+        hidden_states = blk(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        if layer_num in self.deepstack_visual_indexes:
+            deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
+                hidden_states
+            )
+            deepstack_feature_lists.append(deepstack_feature)
+
+    merged_hidden_states = self.merger(hidden_states)
+
+    return BaseModelOutputWithDeepstackFeatures(
+        last_hidden_state=hidden_states,
+        pooler_output=merged_hidden_states,
+        deepstack_features=deepstack_feature_lists,
+    )
 
 
 def get_rope_index(
@@ -57,7 +225,8 @@ def get_rope_index(
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        position_ids = torch.ones(3, input_ids.shape[0], dtype=input_ids.dtype, device=input_ids.device)
+        position_device = input_ids.device
+        position_ids = torch.ones(3, input_ids.shape[0], dtype=input_ids.dtype, device=position_device)
         image_index, video_index = 0, 0
         attention_mask = attention_mask.to(input_ids.device)
         input_ids = input_ids[attention_mask == 1]
@@ -106,20 +275,35 @@ def get_rope_index(
             text_len = ed - st
 
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-            llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+            llm_pos_ids_list.append(torch.arange(text_len, device=position_device).view(1, -1).expand(3, -1) + st_idx)
 
             # t_index is always 0 because llm_grid_t is always 1
             # (we use timestamps to encode the temporal information for videos)
-            t_index = torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
-            h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
-            w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+            t_index = (
+                torch.arange(llm_grid_t, device=position_device)
+                .view(-1, 1)
+                .expand(-1, llm_grid_h * llm_grid_w)
+                .flatten()
+            )
+            h_index = (
+                torch.arange(llm_grid_h, device=position_device)
+                .view(1, -1, 1)
+                .expand(llm_grid_t, -1, llm_grid_w)
+                .flatten()
+            )
+            w_index = (
+                torch.arange(llm_grid_w, device=position_device)
+                .view(1, 1, -1)
+                .expand(llm_grid_t, llm_grid_h, -1)
+                .flatten()
+            )
             llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
             st = ed + llm_grid_t * llm_grid_h * llm_grid_w
 
         if st < len(input_tokens):
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
             text_len = len(input_tokens) - st
-            llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+            llm_pos_ids_list.append(torch.arange(text_len, device=position_device).view(1, -1).expand(3, -1) + st_idx)
 
         llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
         position_ids[..., attention_mask == 1] = llm_positions.to(position_ids.device)
@@ -147,7 +331,7 @@ def _get_input_embeds(
     image_mask, video_mask = None, None
     if pixel_values is not None:
         pixel_values = pixel_values.type(model.visual.dtype)
-        image_embeds, deepstack_image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds, deepstack_image_embeds = _get_visual_embeds(model, pixel_values, image_grid_thw)
         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
         if n_image_tokens != n_image_features:
@@ -165,7 +349,7 @@ def _get_input_embeds(
 
     if pixel_values_videos is not None:
         pixel_values_videos = pixel_values_videos.type(model.visual.dtype)
-        video_embeds, deepstack_video_embeds = model.visual(pixel_values_videos, grid_thw=video_grid_thw)
+        video_embeds, deepstack_video_embeds = _get_visual_embeds(model, pixel_values_videos, video_grid_thw)
         n_video_tokens = (input_ids == model.config.video_token_id).sum().item()
         n_video_features = video_embeds.shape[0]
         if n_video_tokens != n_video_features:
@@ -210,7 +394,7 @@ def _get_input_embeds(
         patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
         pixel_values = torch.zeros((16, patch_dim), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
         image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device=inputs_embeds.device)
-        image_embeds, dummy_deepstack_image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds, dummy_deepstack_image_embeds = _get_visual_embeds(model, pixel_values, image_grid_thw)
         inputs_embeds += 0.0 * image_embeds.mean()
         for emb in dummy_deepstack_image_embeds or []:
             inputs_embeds += 0.0 * emb.mean()

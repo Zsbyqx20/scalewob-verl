@@ -409,23 +409,31 @@ def apply_monkey_patch(
             Qwen3VLForConditionalGeneration,
             Qwen3VLModel,
             Qwen3VLTextModel,
+            Qwen3VLVisionModel,
         )
         from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
             Qwen3VLMoeForConditionalGeneration,
             Qwen3VLMoeModel,
             Qwen3VLMoeTextModel,
+            Qwen3VLMoeVisionModel,
         )
 
         from verl.models.transformers.qwen3_vl import (
             forward_with_normal_backend,
             patch_qwen3_vl_moe_sparse_moe_block_forward,
             qwen3_vl_base_forward,
+            qwen3_vl_fast_pos_embed_interpolate,
+            qwen3_vl_vision_forward,
         )
 
         Qwen3VLModel.forward = qwen3_vl_base_forward
         Qwen3VLMoeModel.forward = qwen3_vl_base_forward
         Qwen3VLForConditionalGeneration.forward = forward_with_normal_backend
         Qwen3VLMoeForConditionalGeneration.forward = forward_with_normal_backend
+        Qwen3VLVisionModel.forward = qwen3_vl_vision_forward
+        Qwen3VLMoeVisionModel.forward = qwen3_vl_vision_forward
+        Qwen3VLVisionModel.fast_pos_embed_interpolate = qwen3_vl_fast_pos_embed_interpolate
+        Qwen3VLMoeVisionModel.fast_pos_embed_interpolate = qwen3_vl_fast_pos_embed_interpolate
         print(f"Monkey patch {model.__class__.__name__} model forward")
 
         # Step 1.5: patch Qwen3VLMoeTextSparseMoeBlock to fix transformers 4.57.3 bug
