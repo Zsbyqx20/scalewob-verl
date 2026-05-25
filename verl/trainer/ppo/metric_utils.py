@@ -27,6 +27,17 @@ from verl import DataProto
 from verl.utils.import_utils import deprecated
 
 
+def _safe_tensor_stats(values: torch.Tensor) -> tuple[float, float, float]:
+    """Return mean/max/min for possibly empty tensors."""
+    if values.numel() == 0:
+        return 0.0, 0.0, 0.0
+    return (
+        torch.mean(values).detach().item(),
+        torch.max(values).detach().item(),
+        torch.min(values).detach().item(),
+    )
+
+
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     """
@@ -135,12 +146,20 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
+    valid_response_token_count = int(response_mask.sum().detach().item())
+    adv_mean, adv_max, adv_min = _safe_tensor_stats(valid_adv)
+    returns_mean, returns_max, returns_min = _safe_tensor_stats(valid_returns)
 
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
-        return_diff_var = torch.var(valid_returns - valid_values)
-        return_var = torch.var(valid_returns)
+        values_mean, values_max, values_min = _safe_tensor_stats(valid_values)
+        if valid_returns.numel() == 0:
+            vf_explained_var = 0.0
+        else:
+            return_diff_var = torch.var(valid_returns - valid_values)
+            return_var = torch.var(valid_returns)
+            vf_explained_var = (1.0 - return_diff_var / (return_var + 1e-5)).detach().item()
 
     # Aborted samples and non-aborted response length statistics
     # response_length_non_aborted/*: statistics computed on non-aborted samples only
@@ -167,21 +186,22 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
         # adv
-        "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
-        "critic/advantages/max": torch.max(valid_adv).detach().item(),
-        "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        "critic/advantages/mean": adv_mean,
+        "critic/advantages/max": adv_max,
+        "critic/advantages/min": adv_min,
         # returns
-        "critic/returns/mean": torch.mean(valid_returns).detach().item(),
-        "critic/returns/max": torch.max(valid_returns).detach().item(),
-        "critic/returns/min": torch.min(valid_returns).detach().item(),
+        "critic/returns/mean": returns_mean,
+        "critic/returns/max": returns_max,
+        "critic/returns/min": returns_min,
+        "critic/valid_response_token_count": valid_response_token_count,
         **(
             {
                 # values
-                "critic/values/mean": torch.mean(valid_values).detach().item(),
-                "critic/values/max": torch.max(valid_values).detach().item(),
-                "critic/values/min": torch.min(valid_values).detach().item(),
+                "critic/values/mean": values_mean,
+                "critic/values/max": values_max,
+                "critic/values/min": values_min,
                 # vf explained var
-                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
+                "critic/vf_explained_var": vf_explained_var,
             }
             if use_critic
             else {}

@@ -348,6 +348,20 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/rewards/mean", metrics)
         self.assertIn("response_length/mean", metrics)
 
+    def test_compute_data_metrics_handles_empty_valid_response_mask(self):
+        """Metric reductions should not crash when all training response tokens are masked out."""
+        self.batch.batch["response_mask"] = torch.zeros((2, 2), dtype=torch.long)
+
+        metrics = compute_data_metrics(self.batch, use_critic=True)
+
+        self.assertEqual(metrics["critic/valid_response_token_count"], 0)
+        self.assertEqual(metrics["critic/advantages/mean"], 0.0)
+        self.assertEqual(metrics["critic/advantages/max"], 0.0)
+        self.assertEqual(metrics["critic/advantages/min"], 0.0)
+        self.assertEqual(metrics["critic/returns/mean"], 0.0)
+        self.assertEqual(metrics["critic/values/mean"], 0.0)
+        self.assertEqual(metrics["critic/vf_explained_var"], 0.0)
+
 
 class TestComputeTimingMetrics(unittest.TestCase):
     """Tests for the compute_timing_metrics function."""
