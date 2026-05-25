@@ -14,11 +14,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import warnings
 from typing import Any, Optional
 
 import numpy as np
-import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -166,8 +166,11 @@ def _to_internal(
     )
 
 
-@pytest.mark.asyncio
-async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu():
+def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu():
+    asyncio.run(_run_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu())
+
+
+async def _run_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu():
     # Minimal config surface used by the agent loops.
     config = OmegaConf.create(
         {
@@ -248,8 +251,11 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     assert merged.non_tensor_batch["tool_rewards"][0] == []
 
 
-@pytest.mark.asyncio
-async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
+def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
+    asyncio.run(_run_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu())
+
+
+async def _run_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
     class _DummyWorker:
         _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
         _compute_position_ids = AgentLoopWorker._compute_position_ids
@@ -292,3 +298,92 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
     torch.testing.assert_close(internal.routed_experts[:, 2:6], expected)
     assert torch.count_nonzero(internal.routed_experts[:, :2]) == 0
     assert torch.count_nonzero(internal.routed_experts[:, 6:]) == 0
+
+
+def test_agent_loop_postprocess_truncates_overlong_prompt_before_padding_on_cpu():
+    asyncio.run(_run_agent_loop_postprocess_truncates_overlong_prompt_before_padding_on_cpu())
+
+
+async def _run_agent_loop_postprocess_truncates_overlong_prompt_before_padding_on_cpu():
+    class _NoTruncatingTokenizer(_FakeTokenizer):
+        def pad(
+            self,
+            encoded_inputs: dict[str, list[int]],
+            *,
+            padding: str,
+            max_length: int,
+            return_tensors: str,
+            return_attention_mask: bool,
+        ) -> dict[str, torch.Tensor]:
+            del padding, return_tensors
+            input_ids = list(encoded_inputs["input_ids"])
+            pad_len = max(0, max_length - len(input_ids))
+            if self.padding_side == "left":
+                padded_ids = [0] * pad_len + input_ids
+                attention_mask = [0] * pad_len + [1] * len(input_ids)
+            else:
+                padded_ids = input_ids + [0] * pad_len
+                attention_mask = [1] * len(input_ids) + [0] * pad_len
+
+            output = {"input_ids": torch.tensor([padded_ids], dtype=torch.long)}
+            if return_attention_mask:
+                output["attention_mask"] = torch.tensor([attention_mask], dtype=torch.long)
+            return output
+
+    class _DummyWorker:
+        _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
+        _compute_position_ids = AgentLoopWorker._compute_position_ids
+        _compute_score = AgentLoopWorker._compute_score
+
+        def __init__(self):
+            self.tokenizer = _NoTruncatingTokenizer()
+            self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": 3})
+            self.processor = None
+            self.reward_loop_worker_handles = None
+
+    worker = _DummyWorker()
+    short = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[11],
+        response_mask=[1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={},
+    )
+    long = AgentLoopOutput(
+        prompt_ids=[201, 202, 203, 204, 205, 206],
+        response_ids=[21, 22, 23, 24],
+        response_mask=[1, 1, 1, 1],
+        response_logprobs=[0.1, 0.2, 0.3, 0.4],
+        metrics=AgentLoopMetrics(),
+        extra_fields={},
+    )
+
+    internal_short = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        short,
+        raw_prompt=[{"role": "user", "content": "short"}],
+    )
+    internal_long = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        long,
+        raw_prompt=[{"role": "user", "content": "long"}],
+    )
+
+    assert internal_short.prompt_ids.shape == (1, 4)
+    assert internal_long.prompt_ids.shape == (1, 4)
+    assert internal_long.response_ids.shape == (1, 3)
+    assert internal_long.response_mask.shape == (1, 3)
+    assert internal_long.response_logprobs.shape == (1, 3)
+    assert internal_long.prompt_ids.tolist() == [[203, 204, 205, 206]]
+    assert internal_long.response_ids.tolist() == [[21, 22, 23]]
+
+    merged = AgentLoopWorker._postprocess(
+        worker,
+        inputs=[internal_short, internal_long],
+        input_non_tensor_batch={
+            "index": np.array([0, 1], dtype=object),
+            "agent_name": np.array(["single_turn_agent", "single_turn_agent"], dtype=object),
+        },
+    )
+    assert merged.batch["prompts"].shape == (2, 4)
+    assert merged.batch["responses"].shape == (2, 3)
