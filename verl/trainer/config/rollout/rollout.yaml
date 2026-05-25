@@ -255,8 +255,15 @@ scalewob:
   headless: true
   screenshot_quality: low
   target_image_hw: [1024, 474]
+  coord_space: normalized
   coord_scale: 1000
+  post_action_wait_seconds: 0.3
+  wait_action_seconds: 1.0
+  max_stale_steps: 3
+  stale_action_penalty: true
+  browser_operation_timeout_seconds: 10.0
   reset_retries: 3
+  reset_retry_delay_seconds: 1.0
   max_env_steps: 10
   action_history_len: 4
   anchor_hash_hw: [64, 64]
@@ -268,6 +275,7 @@ scalewob:
     include_prompt: false
     include_response: true
     save_jsonl: false
+    save_screenshots: false
     output_dir: null
 
 # Checkpoint Engine config for update weights from trainer to rollout

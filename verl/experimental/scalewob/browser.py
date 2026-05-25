@@ -3,11 +3,18 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any
 
 from PIL import Image
+
+
+class ScaleWoBBrowserOperationTimeoutError(TimeoutError):
+    """Raised when a ScaleWoB browser operation exceeds the configured timeout."""
 
 
 @dataclass
@@ -17,8 +24,15 @@ class ScaleWoBBrowserConfig:
     headless: bool = True
     screenshot_quality: str = "low"
     target_image_hw: tuple[int, int] = (1024, 474)
+    coord_space: str = "normalized"
     coord_scale: int = 1000
+    post_action_wait_seconds: float = 0.3
+    wait_action_seconds: float = 1.0
+    max_stale_steps: int = 3
+    stale_action_penalty: bool = True
+    browser_operation_timeout_seconds: float = 10.0
     reset_retries: int = 3
+    reset_retry_delay_seconds: float = 1.0
     max_env_steps: int = 10
     action_history_len: int = 4
     anchor_hash_hw: tuple[int, int] = (64, 64)
@@ -42,6 +56,56 @@ class ScaleWoBBrowser:
         self._automation = None
         self._env_id: str | None = None
         self._task_id: Any = 0
+        self.last_screenshot_size: tuple[int, int] | None = None
+
+    def _call_with_timeout(self, fn, *args, **kwargs):
+        timeout = float(self.config.browser_operation_timeout_seconds)
+        if timeout <= 0:
+            return fn(*args, **kwargs)
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(fn, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise ScaleWoBBrowserOperationTimeoutError(
+                f"{getattr(fn, '__name__', type(fn).__name__)} timed out after {timeout:g}s"
+            ) from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _post_action_wait(self) -> None:
+        delay = float(self.config.post_action_wait_seconds)
+        if delay > 0:
+            time.sleep(delay)
+
+    def _normalized_to_pixel(self, value: Any, limit: int) -> int:
+        if self.config.coord_space != "normalized":
+            raise ValueError(f"unsupported_coord_space: {self.config.coord_space}")
+        scale = float(self.config.coord_scale)
+        if scale <= 0:
+            raise ValueError("coord_scale_must_be_positive")
+        pixel = round(float(value) / scale * (limit - 1))
+        return int(max(0, min(limit - 1, pixel)))
+
+    def _execute_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        executed = dict(action)
+        action_name = str(action.get("action", "")).strip().lower()
+        if action_name in {"tap", "click", "long_press", "long_click"}:
+            if self.last_screenshot_size is None:
+                raise RuntimeError("coordinate action requires a prior screenshot")
+            width, height = self.last_screenshot_size
+            executed["x"] = self._normalized_to_pixel(action.get("x", 0), width)
+            executed["y"] = self._normalized_to_pixel(action.get("y", 0), height)
+        elif action_name in {"swipe", "drag", "scroll"}:
+            if self.last_screenshot_size is None:
+                raise RuntimeError("coordinate action requires a prior screenshot")
+            width, height = self.last_screenshot_size
+            executed["x1"] = self._normalized_to_pixel(action.get("x1", action.get("start_x", 0)), width)
+            executed["y1"] = self._normalized_to_pixel(action.get("y1", action.get("start_y", 0)), height)
+            executed["x2"] = self._normalized_to_pixel(action.get("x2", action.get("end_x", 0)), width)
+            executed["y2"] = self._normalized_to_pixel(action.get("y2", action.get("end_y", 0)), height)
+        return executed
 
     def _ensure_automation(self):
         if self._automation is not None:
@@ -67,87 +131,144 @@ class ScaleWoBBrowser:
         if not self._env_id:
             raise ValueError("ScaleWoB reset requires scalewob_info.env_id")
         self._task_id = scalewob_info.get("task_id", 0)
-        automation = self._ensure_automation()
+        self.last_screenshot_size = None
         last_error = None
-        for _ in range(self.config.reset_retries):
+        for attempt in range(self.config.reset_retries):
             try:
-                automation.start()
-                automation.start_evaluation()
+                automation = self._ensure_automation()
+                self._call_with_timeout(automation.start)
+                self._call_with_timeout(automation.start_evaluation)
                 return {"env_id": self._env_id, "task_id": self._task_id}
             except Exception as exc:
                 last_error = exc
                 self.close()
+                if attempt + 1 < self.config.reset_retries and self.config.reset_retry_delay_seconds > 0:
+                    time.sleep(float(self.config.reset_retry_delay_seconds))
         raise RuntimeError(f"ScaleWoB reset failed after {self.config.reset_retries} retries") from last_error
 
     def screenshot(self) -> Image.Image:
         automation = self._ensure_automation()
-        raw = automation.take_screenshot(format="pil")
+        raw = self._call_with_timeout(automation.take_screenshot, format="pil")
         if isinstance(raw, Image.Image):
-            return raw.convert("RGB")
+            image = raw.convert("RGB")
+            self.last_screenshot_size = image.size
+            return image
         if isinstance(raw, bytes):
-            return Image.open(BytesIO(raw)).convert("RGB")
+            image = Image.open(BytesIO(raw)).convert("RGB")
+            self.last_screenshot_size = image.size
+            return image
         raise TypeError(f"Unsupported screenshot type: {type(raw)}")
 
     def step(self, action: dict[str, Any]) -> dict[str, Any]:
         automation = self._ensure_automation()
-        action_name = str(action.get("action", "")).strip().lower()
+        normalized_action = dict(action)
+        executed_action: dict[str, Any] | None = None
 
-        def invalid_step(error: str) -> dict[str, Any]:
+        def ok_step(*, reward: float = 0.0, done: bool = False, info: dict[str, Any] | None = None) -> dict[str, Any]:
+            step_info = dict(info or {})
+            step_info.setdefault("normalized_action", normalized_action)
+            step_info.setdefault("executed_action", executed_action)
             return {
                 "observation": None,
-                "reward": 0.0,
-                "done": False,
-                "info": {"error": error, "invalid_action": True},
+                "reward": reward,
+                "done": done,
+                "info": step_info,
             }
+
+        def invalid_step(
+            error: str,
+            *,
+            normalized_action: dict[str, Any] | None = None,
+            executed_action: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            return ok_step(
+                info={
+                    "error": error,
+                    "invalid_action": True,
+                    "normalized_action": normalized_action or dict(action),
+                    "executed_action": executed_action,
+                }
+            )
+
+        try:
+            executed_action = self._execute_action(normalized_action)
+        except Exception as exc:
+            return invalid_step(str(exc), normalized_action=normalized_action, executed_action=None)
+        action_name = str(executed_action.get("action", "")).strip().lower()
 
         if action_name in {"tap", "click"}:
             try:
-                automation.click(int(action.get("x", 0)), int(action.get("y", 0)))
-                return {"observation": None, "reward": 0.0, "done": False, "info": {}}
+                self._call_with_timeout(
+                    automation.click,
+                    int(executed_action.get("x", 0)),
+                    int(executed_action.get("y", 0)),
+                )
+                self._post_action_wait()
+                return ok_step()
             except Exception as exc:
-                return invalid_step(str(exc))
+                return invalid_step(str(exc), normalized_action=normalized_action, executed_action=executed_action)
         if action_name in {"long_press", "long_click"}:
             try:
-                automation.long_press(int(action.get("x", 0)), int(action.get("y", 0)))
-                return {"observation": None, "reward": 0.0, "done": False, "info": {}}
+                self._call_with_timeout(
+                    automation.long_press,
+                    int(executed_action.get("x", 0)),
+                    int(executed_action.get("y", 0)),
+                )
+                self._post_action_wait()
+                return ok_step()
             except Exception as exc:
-                return invalid_step(str(exc))
+                return invalid_step(str(exc), normalized_action=normalized_action, executed_action=executed_action)
         if action_name in {"input_text", "type", "text", "input"}:
             try:
-                automation.type(str(action.get("text", "")))
-                return {"observation": None, "reward": 0.0, "done": False, "info": {}}
+                self._call_with_timeout(automation.type, str(executed_action.get("text", "")))
+                self._post_action_wait()
+                return ok_step()
             except Exception as exc:
-                return invalid_step(str(exc))
+                return invalid_step(str(exc), normalized_action=normalized_action, executed_action=executed_action)
         if action_name in {"press_enter", "enter"}:
             try:
-                automation.press_enter()
-                return {"observation": None, "reward": 0.0, "done": False, "info": {}}
+                self._call_with_timeout(automation.press_enter)
+                self._post_action_wait()
+                return ok_step()
             except Exception as exc:
-                return invalid_step(str(exc))
+                return invalid_step(str(exc), normalized_action=normalized_action, executed_action=executed_action)
         if action_name in {"swipe", "drag", "scroll"}:
             try:
-                automation.drag(
-                    int(action.get("x1", action.get("start_x", 0))),
-                    int(action.get("y1", action.get("start_y", 0))),
-                    int(action.get("x2", action.get("end_x", 0))),
-                    int(action.get("y2", action.get("end_y", 0))),
+                self._call_with_timeout(
+                    automation.drag,
+                    int(executed_action.get("x1", executed_action.get("start_x", 0))),
+                    int(executed_action.get("y1", executed_action.get("start_y", 0))),
+                    int(executed_action.get("x2", executed_action.get("end_x", 0))),
+                    int(executed_action.get("y2", executed_action.get("end_y", 0))),
                 )
-                return {"observation": None, "reward": 0.0, "done": False, "info": {}}
+                self._post_action_wait()
+                return ok_step()
             except Exception as exc:
-                return invalid_step(str(exc))
+                return invalid_step(str(exc), normalized_action=normalized_action, executed_action=executed_action)
         if action_name in {"wait", "pause"}:
-            return {"observation": None, "reward": 0.0, "done": False, "info": {}}
+            wait_seconds = float(self.config.wait_action_seconds)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            return ok_step()
         if action_name == "finish":
             try:
-                params = action.get("params")
+                params = executed_action.get("params")
                 if params is not None and not isinstance(params, dict):
-                    return invalid_step("finish_params_must_be_object")
-                result = automation.finish_evaluation(task_id=self._task_id, params=params)
+                    return invalid_step(
+                        "finish_params_must_be_object",
+                        normalized_action=normalized_action,
+                        executed_action=executed_action,
+                    )
+                result = self._call_with_timeout(automation.finish_evaluation, task_id=self._task_id, params=params)
                 reward = 1.0 if result.get("success") else float(result.get("reward", 0.0) or 0.0)
-                return {"observation": None, "reward": reward, "done": True, "info": result}
+                return ok_step(reward=reward, done=True, info=result)
             except Exception as exc:
-                return invalid_step(str(exc))
-        return invalid_step(f"unsupported_action: {action_name}")
+                return invalid_step(str(exc), normalized_action=normalized_action, executed_action=executed_action)
+        return invalid_step(
+            f"unsupported_action: {action_name}",
+            normalized_action=normalized_action,
+            executed_action=executed_action,
+        )
 
     def close(self) -> None:
         if self._automation is not None:

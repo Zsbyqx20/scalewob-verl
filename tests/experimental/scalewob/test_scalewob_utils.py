@@ -1,7 +1,13 @@
+import time
+
 from PIL import Image
 
 from verl.experimental.scalewob.actions import parse_action
-from verl.experimental.scalewob.browser import ScaleWoBBrowser, ScaleWoBBrowserConfig
+from verl.experimental.scalewob.browser import (
+    ScaleWoBBrowser,
+    ScaleWoBBrowserConfig,
+    ScaleWoBBrowserOperationTimeoutError,
+)
 from verl.experimental.scalewob.prompt import build_prompt_messages
 from verl.experimental.scalewob.vision import screenshot_hash
 
@@ -27,6 +33,21 @@ def test_sft_action_parser_accepts_fenced_swipe():
 
     assert parsed.is_action_valid == 1
     assert parsed.raw_action == "device.swipe((100, 800), (100, 300))"
+    assert parsed.action == {"action": "swipe", "x1": 100, "y1": 800, "x2": 100, "y2": 300}
+
+
+def test_sft_action_parser_accepts_drag_alias():
+    parsed = parse_action("Thought: Drag upward.\nAction: `device.drag((100, 800), (100, 300))`")
+
+    assert parsed.is_action_valid == 1
+    assert parsed.raw_action == "device.drag((100, 800), (100, 300))"
+    assert parsed.action == {"action": "swipe", "x1": 100, "y1": 800, "x2": 100, "y2": 300}
+
+
+def test_sft_action_parser_accepts_four_coordinate_motion():
+    parsed = parse_action("Thought: Drag upward.\nAction: `device.drag(100, 800, 100, 300)`")
+
+    assert parsed.is_action_valid == 1
     assert parsed.action == {"action": "swipe", "x1": 100, "y1": 800, "x2": 100, "y2": 300}
 
 
@@ -60,6 +81,40 @@ def test_sft_action_parser_accepts_end_task():
 
 def test_sft_action_parser_accepts_end_task_params():
     parsed = parse_action("Thought: The task is complete.\nAction: `device.end_task('finished', {'order_id': '123'})`")
+
+    assert parsed.is_action_valid == 1
+    assert parsed.action == {"action": "finish", "status": "finished", "params": {"order_id": "123"}}
+
+
+def test_sft_action_parser_ignores_non_object_end_task_params():
+    parsed = parse_action(
+        "Thought: Done.\nAction: `device.end_task('finished', \"Task completed successfully.\")`"
+    )
+
+    assert parsed.is_action_valid == 1
+    assert parsed.action == {"action": "finish", "status": "finished"}
+
+
+def test_sft_action_parser_accepts_end_task_keywords():
+    parsed = parse_action(
+        "Thought: The task is complete.\nAction: `device.end_task(status='finished', params={'order_id': '123'})`"
+    )
+
+    assert parsed.is_action_valid == 1
+    assert parsed.action == {"action": "finish", "status": "finished", "params": {"order_id": "123"}}
+
+
+def test_sft_action_parser_ignores_non_object_end_task_keyword_params():
+    parsed = parse_action(
+        "Thought: Done.\nAction: `device.end_task(status='finished', params='Task completed successfully.')`"
+    )
+
+    assert parsed.is_action_valid == 1
+    assert parsed.action == {"action": "finish", "status": "finished"}
+
+
+def test_json_action_parser_accepts_end_task_alias():
+    parsed = parse_action('{"action": "end_task", "status": "finished", "params": {"order_id": "123"}}')
 
     assert parsed.is_action_valid == 1
     assert parsed.action == {"action": "finish", "status": "finished", "params": {"order_id": "123"}}
@@ -229,8 +284,27 @@ class _FinishAutomation:
         pass
 
 
+class _CoordinateAutomation:
+    def __init__(self):
+        self.clicks = []
+        self.long_presses = []
+        self.drags = []
+
+    def click(self, x: int, y: int):
+        self.clicks.append((x, y))
+
+    def long_press(self, x: int, y: int):
+        self.long_presses.append((x, y))
+
+    def drag(self, x1: int, y1: int, x2: int, y2: int):
+        self.drags.append((x1, y1, x2, y2))
+
+    def close(self):
+        pass
+
+
 def test_browser_step_turns_execution_errors_into_invalid_steps(monkeypatch):
-    browser = ScaleWoBBrowser(ScaleWoBBrowserConfig())
+    browser = ScaleWoBBrowser(ScaleWoBBrowserConfig(post_action_wait_seconds=0))
     dummy = _DummyAutomation()
     browser._automation = dummy
     browser._env_id = "12306"
@@ -256,3 +330,132 @@ def test_browser_step_forwards_finish_params_to_scalewob():
     assert result["reward"] == 1.0
     assert result["done"] is True
     assert dummy.finish_calls == [{"task_id": 7, "params": {"order_id": "123"}}]
+
+
+def test_browser_maps_normalized_click_to_screenshot_pixels():
+    browser = ScaleWoBBrowser(ScaleWoBBrowserConfig(post_action_wait_seconds=0))
+    dummy = _CoordinateAutomation()
+    browser._automation = dummy
+    browser._env_id = "12306"
+    browser.last_screenshot_size = (390, 844)
+
+    result = browser.step({"action": "tap", "x": 500, "y": 500})
+
+    assert dummy.clicks == [(194, 422)]
+    assert result["info"]["normalized_action"] == {"action": "tap", "x": 500, "y": 500}
+    assert result["info"]["executed_action"] == {"action": "tap", "x": 194, "y": 422}
+
+
+def test_browser_maps_max_normalized_coordinate_to_bottom_right_pixel():
+    browser = ScaleWoBBrowser(ScaleWoBBrowserConfig(post_action_wait_seconds=0))
+    dummy = _CoordinateAutomation()
+    browser._automation = dummy
+    browser._env_id = "12306"
+    browser.last_screenshot_size = (390, 844)
+
+    result = browser.step({"action": "tap", "x": 1000, "y": 1000})
+
+    assert dummy.clicks == [(389, 843)]
+    assert result["info"]["executed_action"] == {"action": "tap", "x": 389, "y": 843}
+
+
+def test_browser_maps_swipe_coordinates_to_screenshot_pixels():
+    browser = ScaleWoBBrowser(ScaleWoBBrowserConfig(post_action_wait_seconds=0))
+    dummy = _CoordinateAutomation()
+    browser._automation = dummy
+    browser._env_id = "12306"
+    browser.last_screenshot_size = (390, 844)
+
+    result = browser.step({"action": "swipe", "x1": 0, "y1": 250, "x2": 1000, "y2": 750})
+
+    assert dummy.drags == [(0, 211, 389, 632)]
+    assert result["info"]["normalized_action"] == {"action": "swipe", "x1": 0, "y1": 250, "x2": 1000, "y2": 750}
+    assert result["info"]["executed_action"] == {"action": "swipe", "x1": 0, "y1": 211, "x2": 389, "y2": 632}
+
+
+def test_browser_wait_action_sleeps(monkeypatch):
+    calls = []
+    monkeypatch.setattr("verl.experimental.scalewob.browser.time.sleep", lambda seconds: calls.append(seconds))
+    browser = ScaleWoBBrowser(ScaleWoBBrowserConfig(wait_action_seconds=1.25))
+    browser._automation = _CoordinateAutomation()
+    browser._env_id = "12306"
+
+    result = browser.step({"action": "wait"})
+
+    assert result["info"]["executed_action"] == {"action": "wait"}
+    assert calls == [1.25]
+
+
+def test_browser_operation_timeout_returns_invalid_action():
+    class _BlockingAutomation:
+        def click(self, x: int, y: int):
+            time.sleep(0.05)
+
+    browser = ScaleWoBBrowser(
+        ScaleWoBBrowserConfig(post_action_wait_seconds=0, browser_operation_timeout_seconds=0.001)
+    )
+    browser._automation = _BlockingAutomation()
+    browser._env_id = "12306"
+    browser.last_screenshot_size = (390, 844)
+
+    result = browser.step({"action": "tap", "x": 500, "y": 500})
+
+    assert result["info"]["invalid_action"] is True
+    assert result["info"]["executed_action"] == {"action": "tap", "x": 194, "y": 422}
+    assert "timed out" in result["info"]["error"]
+
+
+def test_browser_call_with_timeout_raises_timeout_error():
+    browser = ScaleWoBBrowser(ScaleWoBBrowserConfig(browser_operation_timeout_seconds=0.001))
+
+    def blocking():
+        time.sleep(0.05)
+
+    try:
+        browser._call_with_timeout(blocking)
+    except ScaleWoBBrowserOperationTimeoutError as exc:
+        assert "timed out" in str(exc)
+    else:
+        raise AssertionError("expected timeout")
+
+
+def test_browser_reset_recreates_automation_after_failed_attempt():
+    class _ResetAutomation:
+        instances = []
+
+        def __init__(self, should_fail: bool):
+            self.should_fail = should_fail
+            self.closed = False
+            self.starts = 0
+            _ResetAutomation.instances.append(self)
+
+        def start(self):
+            self.starts += 1
+            if self.should_fail:
+                raise RuntimeError("first start failed")
+
+        def start_evaluation(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    browser = ScaleWoBBrowser(ScaleWoBBrowserConfig(reset_retries=2, reset_retry_delay_seconds=0))
+    created = 0
+
+    def fake_ensure_automation():
+        nonlocal created
+        if browser._automation is None:
+            browser._automation = _ResetAutomation(should_fail=created == 0)
+            created += 1
+        return browser._automation
+
+    browser._ensure_automation = fake_ensure_automation
+
+    result = browser.reset({"env_id": "shop", "task_id": 3})
+
+    assert result == {"env_id": "shop", "task_id": 3}
+    assert len(_ResetAutomation.instances) == 2
+    assert _ResetAutomation.instances[0].closed is True
+    assert _ResetAutomation.instances[0].starts == 1
+    assert _ResetAutomation.instances[1].starts == 1

@@ -8,6 +8,8 @@ import os
 from typing import Any
 from uuid import uuid4
 
+from PIL import Image
+
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
     AgentLoopMetrics,
@@ -27,6 +29,13 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _compact_error(exc: Exception, max_length: int = 2000) -> str:
+    message = f"{type(exc).__name__}: {exc}"
+    if len(message) <= max_length:
+        return message
+    return message[: max_length - 3] + "..."
+
+
 @register("scalewob_agent")
 class ScaleWoBAgentLoop(AgentLoopBase):
     """ScaleWoB browser rollout loop that emits one training row per browser action step."""
@@ -39,6 +48,89 @@ class ScaleWoBAgentLoop(AgentLoopBase):
         self.browser_config = ScaleWoBBrowserConfig.from_mapping(scalewob or rollout_scalewob)
         self.debug_config = resolve_scalewob_debug_config(self.config, scalewob or rollout_scalewob)
         self.response_length = self.rollout_config.response_length
+
+    def _fallback_token_id(self) -> int:
+        for attr in ("pad_token_id", "eos_token_id"):
+            token_id = getattr(self.tokenizer, attr, None)
+            if token_id is not None:
+                return int(token_id)
+        return 0
+
+    async def _build_inactive_step_output(
+        self,
+        *,
+        phase: str,
+        error: Exception,
+        description: str,
+        scalewob_info: dict[str, Any],
+        extra_info: dict[str, Any],
+        stable_index: Any,
+        traj_uid: str,
+        kwargs: dict[str, Any],
+        metrics: dict[str, Any],
+    ) -> AgentLoopStepOutput:
+        height, width = self.browser_config.target_image_hw
+        screenshot = Image.new("RGB", (int(width), int(height)), "white")
+        anchor_obs = f"{phase}_failed"
+        messages = build_prompt_messages(
+            task_description=description,
+            screenshot=screenshot,
+            action_history=[],
+            action_history_len=self.browser_config.action_history_len,
+        )
+        multi_modal_data = await self.process_vision_info(messages)
+        images = multi_modal_data.get("images")
+        if images is None or len(images) != 1:
+            image_count = 0 if images is None else len(images)
+            raise ValueError(f"ScaleWoB error prompt must contain exactly one image, got {image_count}")
+        prompt_ids = await self.apply_chat_template(messages, images=images)
+        error_text = _compact_error(error)
+        extra_fields = {
+            "uid": kwargs.get("uid"),
+            "index": stable_index,
+            "traj_uid": traj_uid,
+            "step_id": 0,
+            "anchor_obs": anchor_obs,
+            "active_masks": 0,
+            "rewards": 0.0,
+            "is_action_valid": 0,
+            "data_source": kwargs.get("data_source", "scalewob"),
+            "extra_info": extra_info,
+            "turn_scores": [],
+            "tool_rewards": [],
+            "thought": "",
+            "raw_action": "",
+            "normalized_action": {"action": "browser_error", "phase": phase},
+            "action_exec_error": error_text,
+            "rollout_error": f"browser_{phase}_failed",
+        }
+        if self.debug_config["enabled"]:
+            extra_fields.update(
+                {
+                    "env_id": scalewob_info.get("env_id")
+                    or scalewob_info.get("environment_id")
+                    or scalewob_info.get("env"),
+                    "task_id": scalewob_info.get("task_id"),
+                    "task_description": description,
+                    "final_reward": 0.0,
+                }
+            )
+            if self.debug_config["include_prompt"]:
+                extra_fields["prompt_messages"] = messages
+            if self.debug_config["save_screenshots"]:
+                extra_fields["screenshot"] = screenshot.copy()
+        return AgentLoopStepOutput(
+            prompt_ids=prompt_ids,
+            response_ids=[self._fallback_token_id()],
+            response_mask=[0],
+            response_logprobs=None,
+            routed_experts=None,
+            multi_modal_data=multi_modal_data,
+            reward_score=0.0,
+            num_turns=1,
+            metrics=AgentLoopMetrics(**metrics),
+            extra_fields=extra_fields,
+        )
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         extra_info = kwargs.get("extra_info", {}) or {}
@@ -53,11 +145,33 @@ class ScaleWoBAgentLoop(AgentLoopBase):
         env_rewards: list[float] = []
         final_reward = 0.0
         finished = False
+        rollout_error: str | None = None
+        previous_anchor_obs: str | None = None
+        stale_steps = 0
         metrics = {"generate_sequences": 0.0, "tool_calls": 0.0, "num_preempted": 0}
 
         try:
-            browser.reset(scalewob_info)
-            for step_id in range(self.browser_config.max_env_steps):
+            reset_ok = False
+            try:
+                browser.reset(scalewob_info)
+                reset_ok = True
+            except Exception as exc:
+                logger.warning("ScaleWoB browser reset failed; emitting inactive rollout step: %s", _compact_error(exc))
+                step_outputs.append(
+                    await self._build_inactive_step_output(
+                        phase="reset",
+                        error=exc,
+                        description=description,
+                        scalewob_info=scalewob_info,
+                        extra_info=extra_info,
+                        stable_index=stable_index,
+                        traj_uid=traj_uid,
+                        kwargs=kwargs,
+                        metrics=metrics,
+                    )
+                )
+                env_rewards.append(0.0)
+            for step_id in range(self.browser_config.max_env_steps if reset_ok else 0):
                 screenshot = resize_screenshot(browser.screenshot(), self.browser_config.target_image_hw)
                 anchor_obs = screenshot_hash(screenshot, self.browser_config.anchor_hash_hw)
                 messages = build_prompt_messages(
@@ -93,6 +207,24 @@ class ScaleWoBAgentLoop(AgentLoopBase):
                 default_final_reward = env_reward if done else final_reward
                 final_reward = float(step_info.get("final_reward", default_final_reward))
                 env_rewards.append(env_reward)
+                normalized_action = step_info.get("normalized_action", parsed.action)
+                executed_action = step_info.get("executed_action")
+                action_name = str(parsed.action.get("action", "")).strip().lower()
+                stale_previous_anchor_obs = previous_anchor_obs
+                if action_name in {"wait", "pause", "finish"}:
+                    stale_steps = 0
+                elif previous_anchor_obs is not None and anchor_obs == previous_anchor_obs:
+                    stale_steps += 1
+                else:
+                    stale_steps = 0
+                is_stale_cutoff = stale_steps >= int(self.browser_config.max_stale_steps)
+                if is_stale_cutoff:
+                    rollout_error = "browser_stale_state"
+                    if self.browser_config.stale_action_penalty:
+                        execution_valid = 0
+                        env_reward = 0.0
+                        env_rewards[-1] = 0.0
+                previous_anchor_obs = anchor_obs
 
                 extra_fields = {
                     "uid": kwargs.get("uid"),
@@ -109,12 +241,22 @@ class ScaleWoBAgentLoop(AgentLoopBase):
                     "tool_rewards": [],
                     "thought": parsed.thought,
                     "raw_action": parsed.raw_action,
-                    "normalized_action": parsed.action,
+                    "normalized_action": normalized_action,
+                    "executed_action": executed_action,
+                    "stale_steps": stale_steps,
+                    "previous_anchor_obs": stale_previous_anchor_obs,
+                    "current_anchor_obs": anchor_obs,
                 }
                 if parsed.error:
                     extra_fields["action_parse_error"] = parsed.error
                 if step_info.get("error"):
                     extra_fields["action_exec_error"] = step_info["error"]
+                    if "timed out" in str(step_info["error"]):
+                        rollout_error = "browser_operation_timeout"
+                        extra_fields["rollout_error"] = rollout_error
+                if is_stale_cutoff:
+                    extra_fields["rollout_error"] = rollout_error
+                    extra_fields["active_masks"] = 0 if self.browser_config.stale_action_penalty else 1
                 if self.debug_config["enabled"]:
                     extra_fields.update(
                         {
@@ -130,6 +272,8 @@ class ScaleWoBAgentLoop(AgentLoopBase):
                         extra_fields["response_text"] = response_text
                     if self.debug_config["include_prompt"]:
                         extra_fields["prompt_messages"] = messages
+                    if self.debug_config["save_screenshots"]:
+                        extra_fields["screenshot"] = screenshot.copy()
 
                 step_outputs.append(
                     AgentLoopStepOutput(
@@ -161,7 +305,11 @@ class ScaleWoBAgentLoop(AgentLoopBase):
                         "reward": env_reward,
                     }
                 )
-                finished = parsed.action["action"] == "finish"
+                finished = parsed.action["action"] == "finish" and done
+                if is_stale_cutoff:
+                    break
+                if rollout_error == "browser_operation_timeout":
+                    break
                 if finished or done:
                     break
                 if len(response_ids) >= self.response_length:
@@ -184,5 +332,10 @@ class ScaleWoBAgentLoop(AgentLoopBase):
             num_turns=0,
             metrics=AgentLoopMetrics(**metrics),
             step_outputs=step_outputs,
-            extra_fields={"traj_uid": traj_uid, "finished": finished, "rewards": env_rewards},
+            extra_fields={
+                "traj_uid": traj_uid,
+                "finished": finished,
+                "rewards": env_rewards,
+                "rollout_error": rollout_error,
+            },
         )

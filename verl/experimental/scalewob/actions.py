@@ -22,9 +22,11 @@ ACTION_ALIASES = {
     "scroll": "swipe",
     "drag": "swipe",
     "pause": "wait",
+    "end_task": "finish",
+    "finish_task": "finish",
 }
 VALID_ACTIONS = {"tap", "long_press", "input_text", "press_enter", "swipe", "wait", "finish"}
-SUPPORTED_DEVICE_METHODS = {"click", "long_click", "type", "enter", "swipe", "wait", "end_task"}
+SUPPORTED_DEVICE_METHODS = {"click", "long_click", "type", "enter", "swipe", "drag", "wait", "end_task"}
 
 
 @dataclass(frozen=True)
@@ -99,6 +101,17 @@ def _coord_pair(node: ast.AST) -> tuple[Any, Any]:
     return value[0], value[1]
 
 
+def _motion_args(call: ast.Call, method: str) -> tuple[Any, Any, Any, Any]:
+    if len(call.args) == 2:
+        x1, y1 = _coord_pair(call.args[0])
+        x2, y2 = _coord_pair(call.args[1])
+        return x1, y1, x2, y2
+    if len(call.args) == 4:
+        x1, y1, x2, y2 = (_literal(arg) for arg in call.args)
+        return x1, y1, x2, y2
+    raise ValueError(f"device_{method}_requires_start_end")
+
+
 def _optional_finish_status(call: ast.Call) -> str | None:
     if not call.args:
         return None
@@ -112,11 +125,14 @@ def _optional_finish_params(call: ast.Call) -> dict[str, Any] | None:
     if len(call.args) < 2:
         return None
     params = _literal(call.args[1])
-    if params is None:
-        return None
-    if not isinstance(params, dict):
-        raise ValueError("device_end_task_params_must_be_object")
-    return params
+    return params if isinstance(params, dict) else None
+
+
+def _optional_finish_keyword(call: ast.Call, name: str) -> Any:
+    for keyword in call.keywords:
+        if keyword.arg == name:
+            return _literal(keyword.value)
+    return None
 
 
 def _parse_device_action(code: str, coord_scale: int) -> dict[str, Any]:
@@ -143,7 +159,7 @@ def _parse_device_action(code: str, coord_scale: int) -> dict[str, Any]:
     method = func.attr
     if method not in SUPPORTED_DEVICE_METHODS:
         raise ValueError(f"unsupported_device_method: {method}")
-    if call.keywords:
+    if call.keywords and method != "end_task":
         raise ValueError("device_action_keywords_not_supported")
 
     if method == "click":
@@ -170,11 +186,8 @@ def _parse_device_action(code: str, coord_scale: int) -> dict[str, Any]:
         if call.args:
             raise ValueError("device_enter_takes_no_arguments")
         return {"action": "press_enter"}
-    if method == "swipe":
-        if len(call.args) != 2:
-            raise ValueError("device_swipe_requires_start_end")
-        x1, y1 = _coord_pair(call.args[0])
-        x2, y2 = _coord_pair(call.args[1])
+    if method in {"swipe", "drag"}:
+        x1, y1, x2, y2 = _motion_args(call, method)
         return {
             "action": "swipe",
             "x1": _clamp_coord(x1, coord_scale),
@@ -187,11 +200,20 @@ def _parse_device_action(code: str, coord_scale: int) -> dict[str, Any]:
             raise ValueError("device_wait_takes_no_arguments")
         return {"action": "wait"}
     if method == "end_task":
+        unsupported_keywords = [keyword.arg for keyword in call.keywords if keyword.arg not in {"status", "params"}]
+        if unsupported_keywords:
+            raise ValueError("device_end_task_keywords_not_supported")
         if len(call.args) > 2:
             raise ValueError("device_end_task_takes_status_and_optional_params")
         action = {"action": "finish"}
         status = _optional_finish_status(call)
         params = _optional_finish_params(call)
+        keyword_status = _optional_finish_keyword(call, "status")
+        keyword_params = _optional_finish_keyword(call, "params")
+        if status is None and keyword_status is not None:
+            status = str(keyword_status)
+        if params is None and keyword_params is not None:
+            params = keyword_params if isinstance(keyword_params, dict) else None
         if status is not None:
             action["status"] = status
         if params is not None:

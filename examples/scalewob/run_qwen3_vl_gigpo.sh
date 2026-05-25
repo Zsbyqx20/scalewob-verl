@@ -83,7 +83,7 @@ python3 -m verl.trainer.main_ppo \
   +actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap="${FSDP_WRAP_POLICY}" \
   actor_rollout_ref.actor.fsdp_config.param_offload=False \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-  actor_rollout_ref.actor.entropy_from_logits_with_chunking=True \
+  actor_rollout_ref.actor.entropy_from_logits_with_chunking=False \
   actor_rollout_ref.actor.ulysses_sequence_parallel_size="${SP_SIZE}" \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
   actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -95,7 +95,7 @@ python3 -m verl.trainer.main_ppo \
   +actor_rollout_ref.ref.fsdp_config.mixed_precision.buffer_dtype="${MIXED_PRECISION_DTYPE}" \
   actor_rollout_ref.ref.fsdp_config.forward_prefetch=True \
   +actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap="${FSDP_WRAP_POLICY}" \
-  actor_rollout_ref.ref.entropy_from_logits_with_chunking=True \
+  actor_rollout_ref.ref.entropy_from_logits_with_chunking=False \
   actor_rollout_ref.ref.ulysses_sequence_parallel_size="${SP_SIZE}" \
   actor_rollout_ref.rollout.name="${ENGINE}" \
   actor_rollout_ref.rollout.mode=async \
@@ -116,6 +116,9 @@ python3 -m verl.trainer.main_ppo \
   +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=True \
   actor_rollout_ref.rollout.scalewob.debug.enabled=true \
   actor_rollout_ref.rollout.scalewob.debug.log_every_n_steps=1 \
+  actor_rollout_ref.rollout.scalewob.debug.save_jsonl=true \
+  actor_rollout_ref.rollout.scalewob.debug.max_steps_per_trajectory="${MAX_ENV_STEPS}" \
+  actor_rollout_ref.rollout.scalewob.stale_action_penalty=false \
   critic.enable=False \
   reward.reward_model.enable=False \
   trainer.critic_warmup=0 \

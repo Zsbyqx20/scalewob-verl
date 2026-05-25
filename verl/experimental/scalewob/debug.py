@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+from PIL import Image
 
 from verl import DataProto
 
@@ -26,6 +27,7 @@ DEFAULT_DEBUG_CONFIG = {
     "include_prompt": False,
     "include_response": True,
     "save_jsonl": False,
+    "save_screenshots": False,
     "output_dir": None,
 }
 
@@ -77,6 +79,7 @@ def resolve_scalewob_debug_config(config: Any, scalewob_config: Any = None) -> d
     resolved["include_prompt"] = bool(resolved["include_prompt"])
     resolved["include_response"] = bool(resolved["include_response"])
     resolved["save_jsonl"] = bool(resolved["save_jsonl"])
+    resolved["save_screenshots"] = bool(resolved["save_screenshots"])
     return resolved
 
 
@@ -166,6 +169,8 @@ def _batch_records(data: DataProto, debug_config: dict[str, Any]) -> list[dict[s
             record["prompt_messages"] = _as_numpy(non_tensors["prompt_messages"])[i]
         if debug_config.get("include_response", True) and "response_text" in non_tensors:
             record["response_text"] = _as_numpy(non_tensors["response_text"])[i]
+        if debug_config.get("save_screenshots", False) and "screenshot" in non_tensors:
+            record["screenshot"] = _as_numpy(non_tensors["screenshot"])[i]
         records.append(record)
     return records
 
@@ -177,10 +182,30 @@ def _group_records(records: list[dict[str, Any]]) -> OrderedDict[str, list[dict[
     return grouped
 
 
-def _write_jsonl(records: list[dict[str, Any]], debug_config: dict[str, Any], global_step: int | None) -> None:
+def _debug_output_dir(debug_config: dict[str, Any], global_step: int | None) -> str:
     output_dir = str(debug_config["output_dir"])
     step_dir = f"global_step={global_step}" if global_step is not None else "global_step=unknown"
-    output_dir = os.path.join(output_dir, step_dir)
+    return os.path.join(output_dir, step_dir)
+
+
+def _write_screenshots(records: list[dict[str, Any]], debug_config: dict[str, Any], global_step: int | None) -> None:
+    output_dir = _debug_output_dir(debug_config, global_step)
+    screenshot_dir = os.path.join(output_dir, "screenshots")
+    os.makedirs(screenshot_dir, exist_ok=True)
+    for record in records:
+        screenshot = record.pop("screenshot", None)
+        if not isinstance(screenshot, Image.Image):
+            continue
+        traj_uid = str(record["traj_uid"])
+        step_id = _safe_int(record["step_id"])
+        filename = f"trajectory_{traj_uid}_step_{step_id:04d}.png"
+        path = os.path.join(screenshot_dir, filename)
+        screenshot.save(path)
+        record["screenshot_path"] = os.path.relpath(path, output_dir)
+
+
+def _write_jsonl(records: list[dict[str, Any]], debug_config: dict[str, Any], global_step: int | None) -> None:
+    output_dir = _debug_output_dir(debug_config, global_step)
     os.makedirs(output_dir, exist_ok=True)
     for record in records:
         traj_uid = str(record["traj_uid"])
@@ -247,6 +272,12 @@ def log_scalewob_batch_debug(data: DataProto, config: Any, global_step: int | No
                 record["action_parse_error"],
                 record["action_exec_error"],
             )
+
+    if debug_config.get("save_screenshots", False):
+        try:
+            _write_screenshots(sampled_records, debug_config, global_step)
+        except OSError as exc:
+            logger.warning("Failed to write ScaleWOB debug screenshot artifacts: %s", exc)
 
     if debug_config.get("save_jsonl", False):
         try:
