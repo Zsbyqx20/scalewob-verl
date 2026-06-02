@@ -67,6 +67,7 @@ class _ScriptedBrowser:
     fail_on_reset: Exception | None = None
     fail_on_screenshot: Exception | None = None
     screenshots: list[Image.Image] = []
+    tasks: list[dict[str, Any]] = []
 
     def __init__(self, config):
         self.config = config
@@ -80,6 +81,13 @@ class _ScriptedBrowser:
         if _ScriptedBrowser.fail_on_reset is not None:
             raise _ScriptedBrowser.fail_on_reset
         return {"env_id": scalewob_info.get("env_id"), "task_id": scalewob_info.get("task_id", 0)}
+
+    def get_task_metadata(self, task_id=None) -> dict[str, Any] | None:
+        target_task_id = task_id if task_id is not None else self.events[0][1].get("task_id", 0)
+        for task in _ScriptedBrowser.tasks:
+            if str(task.get("task_id")) == str(target_task_id):
+                return dict(task)
+        return None
 
     def screenshot(self) -> Image.Image:
         self.events.append("screenshot")
@@ -106,12 +114,14 @@ def _install_fake_browser(
     fail_on_reset=None,
     fail_on_screenshot=None,
     screenshots=None,
+    tasks=None,
 ):
     _ScriptedBrowser.instances = []
     _ScriptedBrowser.step_results = list(step_results)
     _ScriptedBrowser.fail_on_reset = fail_on_reset
     _ScriptedBrowser.fail_on_screenshot = fail_on_screenshot
     _ScriptedBrowser.screenshots = list(screenshots or [])
+    _ScriptedBrowser.tasks = list(tasks or [])
     monkeypatch.setattr("verl.experimental.scalewob.agent_loop.ScaleWoBBrowser", _ScriptedBrowser)
 
 
@@ -227,6 +237,40 @@ def test_scalewob_agent_loop_runs_multi_step_rollout(monkeypatch):
     assert output.step_outputs[0].extra_fields["executed_action"] is None
     assert output.step_outputs[1].extra_fields["is_action_valid"] == 1
     assert server_manager.calls[0]["image_data"] is not None
+
+
+def test_scalewob_agent_loop_injects_task_params_schema(monkeypatch):
+    _install_fake_browser(
+        monkeypatch,
+        [{"observation": None, "reward": 1.0, "done": True, "info": {"final_reward": 1.0}}],
+        tasks=[
+            {
+                "task_id": 3,
+                "description": "Place the order",
+                "params": {
+                    "type": "object",
+                    "properties": {"order_id": {"type": "string"}},
+                    "required": ["order_id"],
+                },
+            }
+        ],
+    )
+    server_manager = _FakeServerManager([TokenOutput(token_ids=[22], log_probs=[-0.2], num_preempted=0)])
+    tokenizer = _FakeTokenizer({(22,): "Thought: Done.\nAction: `device.end_task('finished')`"})
+    loop = _make_loop(server_manager, tokenizer)
+    captured_messages: list[list[dict[str, Any]]] = []
+    _patch_multimodal_methods(monkeypatch, loop, captured_messages)
+
+    asyncio.run(
+        loop.run(
+            sampling_params={"temperature": 0.0},
+            extra_info={"description": "Place the order", "scalewob": {"env_id": "shop", "task_id": "3"}},
+        )
+    )
+
+    prompt_text = captured_messages[0][0]["content"][0]["text"]
+    assert "When calling `device.end_task(...)`, the `params` object must satisfy this JSON schema:" in prompt_text
+    assert "'order_id'" in prompt_text
 
 
 def test_scalewob_agent_loop_emits_inactive_step_on_reset_failure(monkeypatch):

@@ -56,6 +56,7 @@ class ScaleWoBBrowser:
         self._automation = None
         self._env_id: str | None = None
         self._task_id: Any = 0
+        self._canonical_task_id: Any = None
         self.last_screenshot_size: tuple[int, int] | None = None
 
     def _call_with_timeout(self, fn, *args, **kwargs):
@@ -125,12 +126,37 @@ class ScaleWoBBrowser:
         )
         return self._automation
 
+    def _match_task_id(self, candidate: Any, target: Any) -> bool:
+        if candidate == target:
+            return True
+        if str(candidate) == str(target):
+            return True
+        try:
+            return int(candidate) == int(target)
+        except (TypeError, ValueError):
+            return False
+
+    def get_task_metadata(self, task_id: Any | None = None) -> dict[str, Any] | None:
+        automation = self._ensure_automation()
+        tasks = getattr(automation, "tasks", None)
+        if not tasks:
+            return None
+
+        target_task_id = self._task_id if task_id is None else task_id
+        for task in tasks:
+            if self._match_task_id(task.get("task_id"), target_task_id):
+                if task_id is None:
+                    self._canonical_task_id = task.get("task_id")
+                return dict(task)
+        return None
+
     def reset(self, scalewob_info: dict[str, Any]) -> dict[str, Any]:
         env_id = scalewob_info.get("env_id") or scalewob_info.get("environment_id") or scalewob_info.get("env")
         self._env_id = str(env_id) if env_id is not None and env_id != "" else self._env_id
         if not self._env_id:
             raise ValueError("ScaleWoB reset requires scalewob_info.env_id")
         self._task_id = scalewob_info.get("task_id", 0)
+        self._canonical_task_id = None
         self.last_screenshot_size = None
         last_error = None
         for attempt in range(self.config.reset_retries):
@@ -259,7 +285,8 @@ class ScaleWoBBrowser:
                         normalized_action=normalized_action,
                         executed_action=executed_action,
                     )
-                result = self._call_with_timeout(automation.finish_evaluation, task_id=self._task_id, params=params)
+                task_id = self._canonical_task_id if self._canonical_task_id is not None else self._task_id
+                result = self._call_with_timeout(automation.finish_evaluation, task_id=task_id, params=params)
                 reward = 1.0 if result.get("success") else float(result.get("reward", 0.0) or 0.0)
                 return ok_step(reward=reward, done=True, info=result)
             except Exception as exc:

@@ -241,6 +241,25 @@ def test_prompt_builder_advertises_sft_scalewob_actions():
     assert "If the subtask requires to provide additional params on completion" in prompt_text
 
 
+def test_prompt_builder_includes_task_params_schema():
+    image = Image.new("RGB", (8, 8), "white")
+    messages = build_prompt_messages(
+        task_description="Submit the form",
+        screenshot=image,
+        action_history=[],
+        action_history_len=4,
+        task_params_schema={
+            "type": "object",
+            "properties": {"order_id": {"type": "string"}},
+            "required": ["order_id"],
+        },
+    )
+
+    prompt_text = messages[0]["content"][0]["text"]
+    assert "When calling `device.end_task(...)`, the `params` object must satisfy this JSON schema:" in prompt_text
+    assert "'order_id'" in prompt_text
+
+
 def test_prompt_builder_formats_empty_history():
     image = Image.new("RGB", (8, 8), "white")
     messages = build_prompt_messages(
@@ -275,6 +294,7 @@ class _DummyAutomation:
 class _FinishAutomation:
     def __init__(self):
         self.finish_calls = []
+        self.tasks = [{"task_id": 3, "params": None}]
 
     def finish_evaluation(self, task_id: int = 0, params=None):
         self.finish_calls.append({"task_id": task_id, "params": params})
@@ -298,6 +318,24 @@ class _CoordinateAutomation:
 
     def drag(self, x1: int, y1: int, x2: int, y2: int):
         self.drags.append((x1, y1, x2, y2))
+
+    def close(self):
+        pass
+
+
+class _TaskAutomation:
+    def __init__(self):
+        self.tasks = [
+            {
+                "task_id": 3,
+                "description": "Place the order",
+                "params": {
+                    "type": "object",
+                    "properties": {"order_id": {"type": "string"}},
+                    "required": ["order_id"],
+                },
+            }
+        ]
 
     def close(self):
         pass
@@ -330,6 +368,34 @@ def test_browser_step_forwards_finish_params_to_scalewob():
     assert result["reward"] == 1.0
     assert result["done"] is True
     assert dummy.finish_calls == [{"task_id": 7, "params": {"order_id": "123"}}]
+
+
+def test_browser_finish_uses_canonical_task_id_when_available():
+    browser = ScaleWoBBrowser(ScaleWoBBrowserConfig())
+    dummy = _FinishAutomation()
+    browser._automation = dummy
+    browser._env_id = "12306"
+    browser._task_id = "3"
+    browser._canonical_task_id = 3
+
+    result = browser.step({"action": "finish", "status": "finished", "params": {"order_id": "123"}})
+
+    assert result["reward"] == 1.0
+    assert result["done"] is True
+    assert dummy.finish_calls == [{"task_id": 3, "params": {"order_id": "123"}}]
+
+
+def test_browser_get_task_metadata_matches_string_task_id():
+    browser = ScaleWoBBrowser(ScaleWoBBrowserConfig())
+    browser._automation = _TaskAutomation()
+    browser._env_id = "shop"
+    browser._task_id = "3"
+
+    metadata = browser.get_task_metadata()
+
+    assert metadata is not None
+    assert metadata["task_id"] == 3
+    assert metadata["params"]["required"] == ["order_id"]
 
 
 def test_browser_maps_normalized_click_to_screenshot_pixels():

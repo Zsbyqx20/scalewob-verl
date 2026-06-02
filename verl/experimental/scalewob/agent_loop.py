@@ -149,12 +149,14 @@ class ScaleWoBAgentLoop(AgentLoopBase):
         previous_anchor_obs: str | None = None
         stale_steps = 0
         metrics = {"generate_sequences": 0.0, "tool_calls": 0.0, "num_preempted": 0}
+        task_metadata: dict[str, Any] | None = None
 
         try:
             reset_ok = False
             try:
                 browser.reset(scalewob_info)
                 reset_ok = True
+                task_metadata = browser.get_task_metadata()
             except Exception as exc:
                 logger.warning("ScaleWoB browser reset failed; emitting inactive rollout step: %s", _compact_error(exc))
                 step_outputs.append(
@@ -174,11 +176,15 @@ class ScaleWoBAgentLoop(AgentLoopBase):
             for step_id in range(self.browser_config.max_env_steps if reset_ok else 0):
                 screenshot = resize_screenshot(browser.screenshot(), self.browser_config.target_image_hw)
                 anchor_obs = screenshot_hash(screenshot, self.browser_config.anchor_hash_hw)
+                task_params_schema = None
+                if task_metadata is not None:
+                    task_params_schema = task_metadata.get("params")
                 messages = build_prompt_messages(
                     task_description=description,
                     screenshot=screenshot,
                     action_history=action_history,
                     action_history_len=self.browser_config.action_history_len,
+                    task_params_schema=task_params_schema,
                 )
                 multi_modal_data = await self.process_vision_info(messages)
                 images = multi_modal_data.get("images")
