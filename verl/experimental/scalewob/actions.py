@@ -71,7 +71,7 @@ def _extract_thought(text: str) -> str | None:
 
 
 def _extract_sft_action_code(text: str) -> str | None:
-    inline = re.search(r"^\s*Action:\s*`?([^`\n]+)`?\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
+    inline = re.search(r"^\s*Action:\s*`*([^`\n]+?)`*\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
     if inline:
         return inline.group(1).strip()
 
@@ -135,7 +135,29 @@ def _optional_finish_keyword(call: ast.Call, name: str) -> Any:
     return None
 
 
+def _sanitize_action_code(code: str) -> str:
+    """Best-effort repair of common SFT formatting noise before strict parsing.
+
+    The SFT policy frequently emits otherwise-valid device-use calls wrapped in
+    formatting noise that ``ast.parse`` rejects, which forces a no-op ``wait`` and
+    stalls the rollout (the model then retries the same malformed action, producing
+    bursts of parse errors). The dominant case is paren over-closing on swipe's
+    nested tuples, e.g. ``device.swipe((x1, y1), (x2, y2)))``, plus stray surrounding
+    backticks (e.g. ``device.click(200, 77)```). Strip that noise so the action can
+    be recovered. Only excess *trailing* ``)`` beyond the number of ``(`` are removed,
+    so well-formed code is left untouched.
+    """
+    code = code.strip().strip("`").strip()
+    closes = code.count(")")
+    opens = code.count("(")
+    while closes > opens and code.endswith(")"):
+        code = code[:-1].rstrip()
+        closes -= 1
+    return code
+
+
 def _parse_device_action(code: str, coord_scale: int) -> dict[str, Any]:
+    code = _sanitize_action_code(code)
     try:
         parsed = ast.parse(code, mode="exec")
     except SyntaxError as exc:
