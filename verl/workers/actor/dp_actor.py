@@ -46,6 +46,19 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _finite_or_zero(value: torch.Tensor) -> float:
+    """Return the scalar value for logging, substituting 0.0 when non-finite.
+
+    A NaN/Inf can appear in the *forward value* of an aggregated loss (e.g. pg_loss or
+    kl_loss) when a non-finite entry in the loss matrix enters through a gradient-routing
+    op such as ``torch.maximum``/``torch.where`` — it poisons the reported scalar but
+    contributes no gradient, so ``grad_norm`` stays finite and the optimizer still steps.
+    This guards the *metric only*; the tensor used for ``backward`` is unaffected.
+    """
+    detached = value.detach()
+    return detached.item() if torch.isfinite(detached) else 0.0
+
+
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
 
@@ -657,7 +670,7 @@ class DataParallelPPOActor(BasePPOActor):
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
+                        metrics["actor/kl_loss"] += _finite_or_zero(kl_loss) * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                     if self.config.use_dynamic_bsz:
@@ -670,7 +683,7 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss.backward()
 
-                    metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
+                    metrics["actor/pg_loss"] += _finite_or_zero(pg_loss) * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
