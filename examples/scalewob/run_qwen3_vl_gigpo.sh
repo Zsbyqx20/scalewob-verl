@@ -44,6 +44,7 @@ N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-15}
 SAVE_FREQ=${SAVE_FREQ:-5}
 TEST_FREQ=${TEST_FREQ:-5}
+MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-3}
 LOGGER=${LOGGER:-'["console"]'}
 
 python3 -m verl.trainer.main_ppo \
@@ -131,6 +132,7 @@ python3 -m verl.trainer.main_ppo \
   trainer.resume_mode=auto \
   trainer.val_before_train=True \
   trainer.save_freq="${SAVE_FREQ}" \
+  trainer.max_actor_ckpt_to_keep="${MAX_ACTOR_CKPT_TO_KEEP}" \
   trainer.test_freq="${TEST_FREQ}" \
   trainer.total_epochs="${TOTAL_EPOCHS}" \
   "$@"
