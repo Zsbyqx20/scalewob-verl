@@ -71,10 +71,6 @@ def _extract_thought(text: str) -> str | None:
 
 
 def _extract_sft_action_code(text: str) -> str | None:
-    inline = re.search(r"^\s*Action:\s*`*([^`\n]+?)`*\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
-    if inline:
-        return inline.group(1).strip()
-
     fenced = re.search(r"^\s*Action:\s*```(?:python)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL | re.MULTILINE)
     if fenced:
         return fenced.group(1).strip()
@@ -84,6 +80,10 @@ def _extract_sft_action_code(text: str) -> str | None:
     )
     if fenced_after_action:
         return fenced_after_action.group(1).strip()
+
+    inline = re.search(r"^\s*Action:\s*`*([^`\n]+?)`*\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
+    if inline:
+        return inline.group(1).strip()
     return None
 
 
@@ -141,18 +141,18 @@ def _sanitize_action_code(code: str) -> str:
     The SFT policy frequently emits otherwise-valid device-use calls wrapped in
     formatting noise that ``ast.parse`` rejects, which forces a no-op ``wait`` and
     stalls the rollout (the model then retries the same malformed action, producing
-    bursts of parse errors). The dominant case is paren over-closing on swipe's
-    nested tuples, e.g. ``device.swipe((x1, y1), (x2, y2)))``, plus stray surrounding
-    backticks (e.g. ``device.click(200, 77)```). Strip that noise so the action can
-    be recovered. Only excess *trailing* ``)`` beyond the number of ``(`` are removed,
-    so well-formed code is left untouched.
+    bursts of parse errors). The dominant cases are over-closing brackets, e.g. paren
+    over-closing on swipe's nested tuples ``device.swipe((x1, y1), (x2, y2)))`` or a
+    stray trailing ``]`` ``device.end_task('finished', "...")]``, plus stray surrounding
+    backticks (e.g. ``device.click(200, 77)```). Strip that noise so the action can be
+    recovered. Only excess *trailing* closing brackets beyond the count of their opener
+    are removed, so well-formed code is left untouched.
     """
     code = code.strip().strip("`").strip()
-    closes = code.count(")")
-    opens = code.count("(")
-    while closes > opens and code.endswith(")"):
+    openers = {")": "(", "]": "[", "}": "{"}
+    # Drop excess trailing closing brackets that have no matching opener (over-closing).
+    while code and code[-1] in openers and code.count(code[-1]) > code.count(openers[code[-1]]):
         code = code[:-1].rstrip()
-        closes -= 1
     return code
 
 
