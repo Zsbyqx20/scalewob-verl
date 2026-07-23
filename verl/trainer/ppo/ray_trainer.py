@@ -568,7 +568,6 @@ class RayPPOTrainer:
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
             ]
-            sample_gts.extend(ground_truths)
 
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
@@ -606,7 +605,18 @@ class RayPPOTrainer:
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
-            test_batch = test_batch.union(test_output_gen_batch)
+            if test_output_gen_batch.meta_info.get("rollout_flattened_steps", False):
+                # Flattened rollouts (e.g. ScaleWoB) emit one row per env step, so
+                # test_output_gen_batch is no longer aligned 1:1 with test_batch and
+                # already carries everything downstream code needs (uid, data_source,
+                # rm_scores, __num_turns__, ...) — see the equivalent branch in fit().
+                # ground_truths has no per-step equivalent, so pad with None to keep
+                # sample_gts aligned with the other per-row sample_* lists below.
+                ground_truths = [None] * len(test_output_gen_batch.batch)
+                test_batch = test_output_gen_batch
+            else:
+                test_batch = test_batch.union(test_output_gen_batch)
+            sample_gts.extend(ground_truths)
             test_batch.meta_info["validate"] = True
 
             # Store original inputs

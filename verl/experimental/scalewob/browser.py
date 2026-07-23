@@ -36,13 +36,17 @@ class ScaleWoBBrowserConfig:
     max_env_steps: int = 10
     action_history_len: int = 4
     anchor_hash_hw: tuple[int, int] = (64, 64)
+    # Backend selection: "scalewob" uses the real scalewob package; "playwright" uses a local Chrome.
+    backend: str = "scalewob"
+    chrome_executable: str | None = None
+    window_size: tuple[int, int] = (390, 844)
 
     @classmethod
     def from_mapping(cls, mapping: dict[str, Any] | None) -> "ScaleWoBBrowserConfig":
         if not mapping:
             return cls()
         kwargs = dict(mapping)
-        for key in ("target_image_hw", "anchor_hash_hw"):
+        for key in ("target_image_hw", "anchor_hash_hw", "window_size"):
             if key in kwargs and isinstance(kwargs[key], list):
                 kwargs[key] = tuple(kwargs[key])
         return cls(**{k: v for k, v in kwargs.items() if k in cls.__dataclass_fields__})
@@ -113,6 +117,19 @@ class ScaleWoBBrowser:
             return self._automation
         if not self._env_id:
             raise ValueError("ScaleWoB env_id is not set")
+        if self.config.backend == "playwright":
+            from verl.experimental.scalewob.playwright_backend import PlaywrightScaleWoBAutomation
+
+            self._automation = PlaywrightScaleWoBAutomation(
+                env_id=self._env_id,
+                base_url=self.config.base_url,
+                platform=self.config.platform,
+                headless=self.config.headless,
+                screenshot_quality=self.config.screenshot_quality,
+                chrome_executable=self.config.chrome_executable,
+                window_size=self.config.window_size,
+            )
+            return self._automation
         try:
             from scalewob.automation import ScaleWoBAutomation
         except ImportError as exc:

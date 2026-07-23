@@ -285,6 +285,44 @@ actor_rollout_ref:
         _target_: verl.workers.config.CustomAsyncServerConfig
         path: null
         name: null
+    limit_images: null
+    scalewob:
+      base_url: https://niumascript.com/scalewob-env
+      platform: mobile
+      headless: true
+      screenshot_quality: low
+      target_image_hw:
+      - 1024
+      - 474
+      coord_space: normalized
+      coord_scale: 1000
+      post_action_wait_seconds: 0.3
+      wait_action_seconds: 1.0
+      max_stale_steps: 3
+      stale_action_penalty: true
+      browser_operation_timeout_seconds: 10.0
+      reset_retries: 3
+      reset_retry_delay_seconds: 1.0
+      max_env_steps: 10
+      action_history_len: 4
+      anchor_hash_hw:
+      - 64
+      - 64
+      backend: scalewob
+      chrome_executable: null
+      window_size:
+      - 390
+      - 844
+      debug:
+        enabled: false
+        log_every_n_steps: 10
+        max_trajectories: 2
+        max_steps_per_trajectory: 10
+        include_prompt: false
+        include_response: true
+        save_jsonl: false
+        save_screenshots: false
+        output_dir: null
     checkpoint_engine:
       _target_: verl.workers.config.CheckpointEngineConfig
       backend: naive
@@ -680,6 +718,13 @@ algorithm:
   lam: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: true
+  gigpo:
+    _target_: verl.trainer.config.GiGPOConfig
+    step_advantage_w: 1.0
+    mode: mean_std_norm
+    enable_similarity: false
+    similarity_thresh: 0.95
+    invalid_action_penalty_coef: 0.1
   use_kl_in_reward: false
   kl_penalty: kl
   kl_ctrl:

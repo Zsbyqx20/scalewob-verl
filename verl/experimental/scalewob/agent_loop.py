@@ -101,6 +101,10 @@ class ScaleWoBAgentLoop(AgentLoopBase):
             "thought": "",
             "raw_action": "",
             "normalized_action": {"action": "browser_error", "phase": phase},
+            "executed_action": None,
+            "stale_steps": 0,
+            "previous_anchor_obs": None,
+            "current_anchor_obs": anchor_obs,
             "action_exec_error": error_text,
             "rollout_error": f"browser_{phase}_failed",
         }
@@ -115,6 +119,8 @@ class ScaleWoBAgentLoop(AgentLoopBase):
                     "final_reward": 0.0,
                 }
             )
+            if self.debug_config["include_response"]:
+                extra_fields["response_text"] = ""
             if self.debug_config["include_prompt"]:
                 extra_fields["prompt_messages"] = messages
             if self.debug_config["save_screenshots"]:

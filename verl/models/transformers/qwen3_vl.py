@@ -22,10 +22,21 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    BaseModelOutputWithDeepstackFeatures,
     Qwen3VLCausalLMOutputWithPast,
     Qwen3VLForConditionalGeneration,
 )
+
+try:
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import BaseModelOutputWithDeepstackFeatures
+except ImportError:
+    # Added to transformers after the 4.57.6 release; define it locally for
+    # older installs. It's a plain BaseModelOutputWithPooling subclass with
+    # one extra field, so this stays a drop-in match for the upstream class.
+    from transformers.modeling_outputs import BaseModelOutputWithPooling
+
+    @dataclass
+    class BaseModelOutputWithDeepstackFeatures(BaseModelOutputWithPooling):
+        deepstack_features: Optional[list[torch.FloatTensor]] = None
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))

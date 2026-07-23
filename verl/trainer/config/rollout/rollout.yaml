@@ -267,6 +267,10 @@ scalewob:
   max_env_steps: 10
   action_history_len: 4
   anchor_hash_hw: [64, 64]
+  # Backend selection: "scalewob" uses the real scalewob package; "playwright" uses a local Chrome.
+  backend: scalewob
+  chrome_executable: null
+  window_size: [390, 844]
   debug:
     enabled: false
     log_every_n_steps: 10
