@@ -302,6 +302,9 @@ class ScaleWoBBrowser:
                         normalized_action=normalized_action,
                         executed_action=executed_action,
                     )
+                status = str(executed_action.get("status", "")).strip().lower()
+                if status in {"infeasible", "failed"}:
+                    return ok_step(reward=0.0, done=True, info={"success": False, "status": status})
                 task_id = self._canonical_task_id if self._canonical_task_id is not None else self._task_id
                 result = self._call_with_timeout(automation.finish_evaluation, task_id=task_id, params=params)
                 reward = 1.0 if result.get("success") else float(result.get("reward", 0.0) or 0.0)

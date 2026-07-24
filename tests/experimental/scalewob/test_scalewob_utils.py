@@ -370,6 +370,34 @@ def test_browser_step_forwards_finish_params_to_scalewob():
     assert dummy.finish_calls == [{"task_id": 7, "params": {"order_id": "123"}}]
 
 
+def test_browser_finish_infeasible_status_short_circuits_zero_reward():
+    browser = ScaleWoBBrowser(ScaleWoBBrowserConfig())
+    dummy = _FinishAutomation()
+    browser._automation = dummy
+    browser._env_id = "12306"
+    browser._task_id = 7
+
+    result = browser.step({"action": "finish", "status": "infeasible"})
+
+    assert result["reward"] == 0.0
+    assert result["done"] is True
+    assert dummy.finish_calls == []
+
+
+def test_browser_finish_failed_status_short_circuits_zero_reward():
+    browser = ScaleWoBBrowser(ScaleWoBBrowserConfig())
+    dummy = _FinishAutomation()
+    browser._automation = dummy
+    browser._env_id = "12306"
+    browser._task_id = 7
+
+    result = browser.step({"action": "finish", "status": "failed"})
+
+    assert result["reward"] == 0.0
+    assert result["done"] is True
+    assert dummy.finish_calls == []
+
+
 def test_browser_finish_uses_canonical_task_id_when_available():
     browser = ScaleWoBBrowser(ScaleWoBBrowserConfig())
     dummy = _FinishAutomation()
