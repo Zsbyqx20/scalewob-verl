@@ -47,6 +47,20 @@ def _is_url(value: str | None) -> bool:
     return value.startswith(("http://", "https://", "file://", "about:"))
 
 
+def _resolve_env_url(env_id: str | None, base_url: str | None) -> str:
+    """Resolve an ``env_id`` (a bare env name or an already-complete URL) to a URL.
+
+    Training data passes bare env names (e.g. ``"BestBuy"``, ``"12306"``); only ad-hoc/manual
+    usage passes a full URL directly. Bare names are joined with ``base_url`` to reach the
+    env's ``index.html``, matching the URL contract served by ``scripts/serve_scalewob.py``.
+    """
+    if _is_url(env_id):
+        return env_id
+    if not env_id or not base_url:
+        return "about:blank"
+    return f"{base_url.rstrip('/')}/{env_id}/index.html"
+
+
 class PlaywrightScaleWoBAutomation:
     """Playwright-based browser automation compatible with ``ScaleWoBBrowser``.
 
@@ -183,7 +197,7 @@ class PlaywrightScaleWoBAutomation:
     def _start_evaluation(self) -> None:
         if self._page is None:
             self._start()
-        url = self._env_id if _is_url(self._env_id) else "about:blank"
+        url = _resolve_env_url(self._env_id, self._base_url)
         if url == "about:blank":
             # Render a minimal placeholder page so the screenshot is not empty.
             self._page.set_content(
@@ -272,22 +286,37 @@ class PlaywrightScaleWoBAutomation:
     # Finish / reward
     # ------------------------------------------------------------------
     def finish_evaluation(self, task_id: Any = 0, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Evaluate a task finish and return a reward.
+        """Evaluate a task finish by calling the environment's own ``window.evaluateTask``.
 
-        The reward logic is intentionally simple for local smoke runs:
-
-        - If ``params`` contains ``success_selector`` or ``success_text``, the page is
-          checked for that selector/text. Success yields reward 1.0, otherwise 0.0.
-        - If neither is provided, the agent is assumed to have succeeded and the reward
-          is 1.0.
-
-        Users should override this for real task evaluation.
+        Falls back to the ``success_selector``/``success_text`` params-based check (and, absent
+        those, an unconditional success) only if the page does not expose ``evaluateTask`` at all
+        (e.g. a manually-opened URL that isn't a ScaleWoB env bundle).
         """
         return self._run(self._finish_evaluation, task_id, params)
 
     def _finish_evaluation(self, task_id: Any, params: dict[str, Any] | None) -> dict[str, Any]:
         self._task_id = task_id
         self._params = params or {}
+
+        has_evaluate_task = self._page.evaluate("typeof window.evaluateTask === 'function'")
+        if has_evaluate_task:
+            numeric_task_id: Any
+            try:
+                numeric_task_id = int(task_id)
+            except (TypeError, ValueError):
+                numeric_task_id = task_id
+            eval_params = {"taskId": numeric_task_id, **self._params}
+            result = self._page.evaluate("(params) => window.evaluateTask(params)", eval_params)
+            success = bool(result.get("success"))
+            return {
+                "success": success,
+                "reward": 1.0 if success else 0.0,
+                "task_id": task_id,
+                "params": params,
+                "message": result.get("message"),
+                "score": result.get("score"),
+            }
+
         reward = 1.0
         success = True
         success_selector = self._params.get("success_selector")
