@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
 from verl.experimental.scalewob.playwright_backend import PlaywrightScaleWoBAutomation, _resolve_env_url
+
+_CHROME_EXECUTABLE = os.environ.get("CHROME_EXECUTABLE", "/workspace/chrome/chrome-linux64/chrome")
+_HAS_CHROME = os.path.isfile(_CHROME_EXECUTABLE)
 
 
 def test_resolve_env_url_joins_bare_env_id_with_base_url():
@@ -92,3 +101,66 @@ def test_finish_evaluation_falls_back_to_params_when_no_evaluate_task():
     result = automation._finish_evaluation(task_id="1", params=None)
 
     assert result == {"success": True, "reward": 1.0, "task_id": "1", "params": None}
+
+
+@pytest.mark.skipif(not _HAS_CHROME, reason=f"chrome executable not found at {_CHROME_EXECUTABLE}")
+def test_close_recovers_when_worker_thread_is_wedged_in_evaluate():
+    """page.evaluate() (used by finish_evaluation/_type) ignores set_default_timeout, so a
+    stuck env page can wedge the single worker thread forever. close() must still return by
+    force-killing the underlying Chrome process instead of waiting on that thread.
+    """
+    automation = PlaywrightScaleWoBAutomation(chrome_executable=_CHROME_EXECUTABLE, headless=True)
+    automation.start()
+    automation.start_evaluation()
+
+    # Queue a call that hangs forever on the same single-worker executor `close()` would
+    # otherwise queue behind, reproducing the reported production hang.
+    wedge_future = automation._executor.submit(automation._page.evaluate, "new Promise(() => {})")
+    time.sleep(0.5)
+    assert not wedge_future.done()
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        close_future = ex.submit(automation.close)
+        close_future.result(timeout=10)
+    elapsed = time.time() - t0
+
+    assert elapsed < 10
+    assert automation._closed is True
+
+
+@pytest.mark.skipif(not _HAS_CHROME, reason=f"chrome executable not found at {_CHROME_EXECUTABLE}")
+def test_finish_evaluation_hang_is_bounded_by_browser_operation_timeout():
+    """Reproduces the reported production hang end-to-end through ScaleWoBBrowser: a page
+    whose window.evaluateTask never resolves must not wedge the caller past the configured
+    browser_operation_timeout_seconds, and the browser must still be closeable afterwards.
+    """
+    from verl.experimental.scalewob.browser import ScaleWoBBrowser, ScaleWoBBrowserConfig
+
+    browser = ScaleWoBBrowser(
+        ScaleWoBBrowserConfig(
+            backend="playwright",
+            chrome_executable=_CHROME_EXECUTABLE,
+            browser_operation_timeout_seconds=2.0,
+        )
+    )
+    browser._env_id = "about:blank"
+    automation = browser._ensure_automation()
+    automation.start()
+    automation.start_evaluation()
+    automation._run(
+        automation._page.set_content,
+        "<html><body><script>window.evaluateTask = () => new Promise(() => {});</script></body></html>",
+    )
+
+    t0 = time.time()
+    result = browser.step({"action": "finish", "status": "finished"})
+    elapsed = time.time() - t0
+
+    assert elapsed < 5
+    assert result["info"].get("invalid_action") is True
+    assert "timed out" in result["info"]["error"]
+
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        close_future = ex.submit(browser.close)
+        close_future.result(timeout=10)

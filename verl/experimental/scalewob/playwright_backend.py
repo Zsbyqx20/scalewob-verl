@@ -31,14 +31,62 @@ Or set ``browser_config.backend = "playwright"`` (after the accompanying ``brows
 change) and pass ``browser_config.chrome_executable`` / ``browser_config.window_size``.
 """
 
+import concurrent.futures
 import io
+import logging
+import os
+import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import psutil
 from PIL import Image
 from playwright.sync_api import sync_playwright
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+# page.evaluate() (used by finish_evaluation's window.evaluateTask call and by
+# _type's activeElement check) does not honor page.set_default_timeout() -- a
+# hung env page can block it forever. Bound how long close() waits for the
+# worker thread before giving up and force-killing the browser process instead.
+_CLOSE_TIMEOUT_SECONDS = 5.0
+
+
+class _DaemonSingleThreadExecutor:
+    """Runs submitted calls on a single dedicated daemon thread.
+
+    This exists instead of ``concurrent.futures.ThreadPoolExecutor`` because that class's
+    worker threads are never daemon threads: if a submitted call hangs forever (e.g. a
+    Playwright ``page.evaluate()`` stuck on an unresponsive page), the interpreter's
+    ``concurrent.futures.thread._python_exit`` atexit hook will try to ``join()`` that thread
+    and block process shutdown forever, even after we've given up on the call and moved on.
+    A daemon thread lets a permanently wedged call be abandoned safely: the thread leaks until
+    the process exits, but it never blocks that exit.
+    """
+
+    def __init__(self, thread_name: str):
+        self._queue: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(target=self._worker, name=thread_name, daemon=True)
+        self._thread.start()
+
+    def _worker(self) -> None:
+        while True:
+            fn, args, kwargs, future = self._queue.get()
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:  # noqa: BLE001 - propagate to the caller via the future
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+    def submit(self, fn, *args, **kwargs) -> "concurrent.futures.Future":
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        self._queue.put((fn, args, kwargs, future))
+        return future
 
 
 def _is_url(value: str | None) -> bool:
@@ -95,7 +143,7 @@ class PlaywrightScaleWoBAutomation:
             "(KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36"
         )
 
-        self._executor: ThreadPoolExecutor | None = None
+        self._executor: _DaemonSingleThreadExecutor | None = None
         self._lock = threading.Lock()
         self._closed = False
 
@@ -109,13 +157,20 @@ class PlaywrightScaleWoBAutomation:
         self._params: dict[str, Any] | None = None
         self.tasks: list[dict[str, Any]] = []
 
+        # PID of the Playwright driver process (node subprocess that owns the browser).
+        # Tracked so a wedged worker thread (e.g. stuck inside page.evaluate(), which does
+        # not honor set_default_timeout) can still be recovered by killing the underlying
+        # OS process tree from outside that thread -- Python cannot forcibly stop a running
+        # thread, so this is the only reliable way to unblock it.
+        self._driver_pid: int | None = None
+
     def _run(self, fn, *args, **kwargs):
         """Dispatch ``fn`` to the worker thread and return its result."""
         with self._lock:
             if self._closed:
                 raise RuntimeError("Playwright automation has been closed")
             if self._executor is None:
-                self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scalewob-playwright")
+                self._executor = _DaemonSingleThreadExecutor(thread_name="scalewob-playwright")
         return self._executor.submit(fn, *args, **kwargs).result()
 
     # ------------------------------------------------------------------
@@ -138,6 +193,18 @@ class PlaywrightScaleWoBAutomation:
         if self._chrome_executable:
             launch_kwargs["executable_path"] = self._chrome_executable
         self._browser = self._playwright.chromium.launch(**launch_kwargs)
+        # The driver subprocess (playwright's node process) parents the actual
+        # chromium process tree; capture its PID now while we know it's alive so
+        # close()/kill() can find and terminate that tree later even if the
+        # worker thread that owns self._browser is itself wedged. This reaches into
+        # a private attribute because the sync API exposes no public accessor for
+        # it; fail soft (kill-on-timeout just becomes a no-op) if it ever changes.
+        try:
+            driver_proc = self._playwright._impl_obj._connection._transport._proc
+            self._driver_pid = driver_proc.pid
+        except AttributeError:
+            logger.warning("could not determine Playwright driver PID; force-kill-on-timeout will be unavailable")
+            self._driver_pid = None
         self._context = self._browser.new_context(
             viewport={"width": self._window_size[0], "height": self._window_size[1]},
             user_agent=self._mobile_user_agent,
@@ -148,15 +215,36 @@ class PlaywrightScaleWoBAutomation:
         self._page.set_default_timeout(5000)
 
     def close(self) -> None:
+        """Close the browser, tearing down the OS process tree if the worker thread is wedged.
+
+        ``page.evaluate()`` (used by ``finish_evaluation`` and ``_type``) does not honor
+        ``page.set_default_timeout()``, so a hung env page can block the single worker thread
+        forever. In that case a plain ``close()`` call queued behind it would also hang forever
+        (Python cannot forcibly stop a running thread), so we bound the wait and fall back to
+        killing the browser's OS process tree directly, which unblocks the wedged call too.
+        Once that happens the worker thread is abandoned for good (it may still be parked
+        inside Playwright's now-dead dispatcher fiber) -- safe because it's a daemon thread,
+        so it can never block process shutdown.
+        """
         with self._lock:
             if self._closed:
                 return
             self._closed = True
             executor = self._executor
             self._executor = None
-        if executor is not None:
-            executor.submit(self._close).result()
-            executor.shutdown(wait=True)
+        if executor is None:
+            return
+        future = executor.submit(self._close)
+        try:
+            future.result(timeout=_CLOSE_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "PlaywrightScaleWoBAutomation.close() timed out after %.1fs; force-killing browser process tree",
+                _CLOSE_TIMEOUT_SECONDS,
+            )
+            self._kill_process_tree()
+        except Exception:
+            logger.warning("PlaywrightScaleWoBAutomation._close() raised", exc_info=True)
 
     def _close(self) -> None:
         if self._page is not None:
@@ -183,6 +271,27 @@ class PlaywrightScaleWoBAutomation:
             except Exception:
                 pass
             self._playwright = None
+
+    def _kill_process_tree(self) -> None:
+        """Force-kill the Playwright driver process and any chromium descendants.
+
+        Safe to call from any thread, including while the dedicated worker thread is stuck
+        inside a hung Playwright call -- SIGKILL-ing the underlying process immediately fails
+        that pending call rather than waiting for it to return.
+        """
+        if self._driver_pid is None:
+            return
+        try:
+            driver = psutil.Process(self._driver_pid)
+        except psutil.NoSuchProcess:
+            return
+        procs = [driver, *driver.children(recursive=True)]
+        for proc in procs:
+            try:
+                proc.kill()
+            except psutil.NoSuchProcess:
+                pass
+        psutil.wait_procs(procs, timeout=_CLOSE_TIMEOUT_SECONDS)
 
     def __del__(self):
         self.close()

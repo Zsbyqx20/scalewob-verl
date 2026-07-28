@@ -3,6 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -327,7 +328,13 @@ class ScaleWoBAgentLoop(AgentLoopBase):
                 if len(response_ids) >= self.response_length:
                     break
         finally:
-            browser.close()
+            # browser.close() can block for a few seconds if the underlying page is wedged
+            # (see ScaleWoBBrowser.close / PlaywrightScaleWoBAutomation.close); run it off the
+            # event loop so a single stuck trajectory can't stall every other rollout this
+            # AgentLoopWorker is concurrently driving via asyncio.gather. Use the currently
+            # running loop rather than self.loop (captured at __init__ time), since the two
+            # can differ in tests / across nested event loops.
+            await asyncio.get_running_loop().run_in_executor(None, browser.close)
 
         for step_output in step_outputs:
             step_output.reward_score = final_reward
