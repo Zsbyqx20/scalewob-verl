@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-import pytest
 from omegaconf import OmegaConf
 from PIL import Image
 
@@ -301,7 +300,7 @@ def test_scalewob_agent_loop_emits_inactive_step_on_reset_failure(monkeypatch):
     assert "window.getTasks is not a function" in step.extra_fields["action_exec_error"]
 
 
-def test_scalewob_agent_loop_closes_browser_on_screenshot_failure(monkeypatch):
+def test_scalewob_agent_loop_emits_inactive_step_on_screenshot_failure(monkeypatch):
     _install_fake_browser(
         monkeypatch,
         [],
@@ -311,11 +310,22 @@ def test_scalewob_agent_loop_closes_browser_on_screenshot_failure(monkeypatch):
     captured_messages: list[list[dict[str, Any]]] = []
     _patch_multimodal_methods(monkeypatch, loop, captured_messages)
 
-    with pytest.raises(RuntimeError, match="screenshot failed"):
-        asyncio.run(loop.run(sampling_params={}, extra_info={"scalewob": {"env_id": "shop"}}))
+    output = asyncio.run(loop.run(sampling_params={}, extra_info={"scalewob": {"env_id": "shop"}}))
 
     assert _ScriptedBrowser.instances[0].closed is True
     assert _ScriptedBrowser.instances[0].events[-1] == "close"
+    assert output.reward_score == 0.0
+    assert output.extra_fields["finished"] is False
+    assert output.extra_fields["rollout_error"] == "browser_step_failed"
+    assert output.extra_fields["rewards"] == [0.0]
+    assert len(output.step_outputs) == 1
+    step = output.step_outputs[0]
+    assert step.response_mask == [0]
+    assert step.extra_fields["active_masks"] == 0
+    assert step.extra_fields["is_action_valid"] == 0
+    assert step.extra_fields["normalized_action"] == {"action": "browser_error", "phase": "step"}
+    assert step.extra_fields["rollout_error"] == "browser_step_failed"
+    assert "screenshot failed" in step.extra_fields["action_exec_error"]
 
 
 def test_scalewob_agent_loop_continues_after_invalid_finish_action(monkeypatch):

@@ -128,6 +128,7 @@ class ScaleWoBBrowser:
                 screenshot_quality=self.config.screenshot_quality,
                 chrome_executable=self.config.chrome_executable,
                 window_size=self.config.window_size,
+                default_timeout_seconds=self.config.browser_operation_timeout_seconds,
             )
             return self._automation
         try:

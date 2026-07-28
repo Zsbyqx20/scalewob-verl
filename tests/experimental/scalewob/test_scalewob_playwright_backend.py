@@ -104,6 +104,25 @@ def test_finish_evaluation_falls_back_to_params_when_no_evaluate_task():
 
 
 @pytest.mark.skipif(not _HAS_CHROME, reason=f"chrome executable not found at {_CHROME_EXECUTABLE}")
+def test_page_default_timeout_matches_configured_browser_operation_timeout():
+    """Playwright's own page.set_default_timeout() must be kept in sync with
+    ScaleWoBBrowserConfig.browser_operation_timeout_seconds (passed through as
+    default_timeout_seconds), or a screenshot/click/etc. can spuriously fire Playwright's
+    own (previously hardcoded 5s) timeout before the caller's configured timeout ever gets
+    a chance -- this is what caused a production job to crash on a routine 5s screenshot
+    stall well under the operator's configured 10s budget.
+    """
+    automation = PlaywrightScaleWoBAutomation(
+        chrome_executable=_CHROME_EXECUTABLE, headless=True, default_timeout_seconds=17.0
+    )
+    automation.start()
+
+    assert automation._page._impl_obj._timeout_settings.timeout() == 17000
+
+    automation.close()
+
+
+@pytest.mark.skipif(not _HAS_CHROME, reason=f"chrome executable not found at {_CHROME_EXECUTABLE}")
 def test_close_recovers_when_worker_thread_is_wedged_in_evaluate():
     """page.evaluate() (used by finish_evaluation/_type) ignores set_default_timeout, so a
     stuck env page can wedge the single worker thread forever. close() must still return by
@@ -134,6 +153,12 @@ def test_finish_evaluation_hang_is_bounded_by_browser_operation_timeout():
     """Reproduces the reported production hang end-to-end through ScaleWoBBrowser: a page
     whose window.evaluateTask never resolves must not wedge the caller past the configured
     browser_operation_timeout_seconds, and the browser must still be closeable afterwards.
+
+    browser_operation_timeout_seconds also becomes Playwright's own page.set_default_timeout
+    (see the fix in playwright_backend.py), which governs ordinary setup calls too (e.g. the
+    initial screenshot in start_evaluation) -- so it needs enough slack that routine CI/test
+    contention doesn't false-positive on setup, while still being far short of "forever" for
+    the assertion that the intentionally-wedged finish() call gets bounded.
     """
     from verl.experimental.scalewob.browser import ScaleWoBBrowser, ScaleWoBBrowserConfig
 
@@ -141,7 +166,7 @@ def test_finish_evaluation_hang_is_bounded_by_browser_operation_timeout():
         ScaleWoBBrowserConfig(
             backend="playwright",
             chrome_executable=_CHROME_EXECUTABLE,
-            browser_operation_timeout_seconds=2.0,
+            browser_operation_timeout_seconds=5.0,
         )
     )
     browser._env_id = "about:blank"
@@ -157,7 +182,7 @@ def test_finish_evaluation_hang_is_bounded_by_browser_operation_timeout():
     result = browser.step({"action": "finish", "status": "finished"})
     elapsed = time.time() - t0
 
-    assert elapsed < 5
+    assert elapsed < 15
     assert result["info"].get("invalid_action") is True
     assert "timed out" in result["info"]["error"]
 

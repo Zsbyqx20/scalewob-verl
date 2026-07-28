@@ -69,6 +69,7 @@ class ScaleWoBAgentLoop(AgentLoopBase):
         traj_uid: str,
         kwargs: dict[str, Any],
         metrics: dict[str, Any],
+        step_id: int = 0,
     ) -> AgentLoopStepOutput:
         height, width = self.browser_config.target_image_hw
         screenshot = Image.new("RGB", (int(width), int(height)), "white")
@@ -90,7 +91,7 @@ class ScaleWoBAgentLoop(AgentLoopBase):
             "uid": kwargs.get("uid"),
             "index": stable_index,
             "traj_uid": traj_uid,
-            "step_id": 0,
+            "step_id": step_id,
             "anchor_obs": anchor_obs,
             "active_masks": 0,
             "rewards": 0.0,
@@ -181,38 +182,67 @@ class ScaleWoBAgentLoop(AgentLoopBase):
                 )
                 env_rewards.append(0.0)
             for step_id in range(self.browser_config.max_env_steps if reset_ok else 0):
-                screenshot = resize_screenshot(browser.screenshot(), self.browser_config.target_image_hw)
-                anchor_obs = screenshot_hash(screenshot, self.browser_config.anchor_hash_hw)
-                task_params_schema = None
-                if task_metadata is not None:
-                    task_params_schema = task_metadata.get("params")
-                messages = build_prompt_messages(
-                    task_description=description,
-                    screenshot=screenshot,
-                    action_history=action_history,
-                    action_history_len=self.browser_config.action_history_len,
-                    task_params_schema=task_params_schema,
-                )
-                multi_modal_data = await self.process_vision_info(messages)
-                images = multi_modal_data.get("images")
-                if images is None or len(images) != 1:
-                    image_count = 0 if images is None else len(images)
-                    raise ValueError(f"ScaleWoB step prompt must contain exactly one image, got {image_count}")
-                prompt_ids = await self.apply_chat_template(messages, images=images)
-
-                with simple_timer("generate_sequences", metrics):
-                    token_output: TokenOutput = await self.server_manager.generate(
-                        request_id=uuid4().hex,
-                        prompt_ids=prompt_ids,
-                        sampling_params=sampling_params,
-                        image_data=images,
+                try:
+                    screenshot = resize_screenshot(browser.screenshot(), self.browser_config.target_image_hw)
+                    anchor_obs = screenshot_hash(screenshot, self.browser_config.anchor_hash_hw)
+                    task_params_schema = None
+                    if task_metadata is not None:
+                        task_params_schema = task_metadata.get("params")
+                    messages = build_prompt_messages(
+                        task_description=description,
+                        screenshot=screenshot,
+                        action_history=action_history,
+                        action_history_len=self.browser_config.action_history_len,
+                        task_params_schema=task_params_schema,
                     )
-                metrics["num_preempted"] += token_output.num_preempted if token_output.num_preempted is not None else 0
+                    multi_modal_data = await self.process_vision_info(messages)
+                    images = multi_modal_data.get("images")
+                    if images is None or len(images) != 1:
+                        image_count = 0 if images is None else len(images)
+                        raise ValueError(f"ScaleWoB step prompt must contain exactly one image, got {image_count}")
+                    prompt_ids = await self.apply_chat_template(messages, images=images)
 
-                response_ids = token_output.token_ids[: self.response_length]
-                response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-                parsed = parse_action(response_text, coord_scale=self.browser_config.coord_scale)
-                step_result = browser.step(parsed.action)
+                    with simple_timer("generate_sequences", metrics):
+                        token_output: TokenOutput = await self.server_manager.generate(
+                            request_id=uuid4().hex,
+                            prompt_ids=prompt_ids,
+                            sampling_params=sampling_params,
+                            image_data=images,
+                        )
+                    metrics["num_preempted"] += (
+                        token_output.num_preempted if token_output.num_preempted is not None else 0
+                    )
+
+                    response_ids = token_output.token_ids[: self.response_length]
+                    response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                    parsed = parse_action(response_text, coord_scale=self.browser_config.coord_scale)
+                    step_result = browser.step(parsed.action)
+                except Exception as exc:
+                    # A browser-side failure here (e.g. a Playwright screenshot timeout under
+                    # heavy concurrent-trajectory load) must not propagate out of run(): doing
+                    # so would fail the asyncio.gather() in AgentLoopWorker.generate_sequences,
+                    # taking down every other trajectory sharing this worker and, ultimately,
+                    # the whole training job. Emit an inactive step and end this rollout instead.
+                    logger.warning(
+                        "ScaleWoB browser step failed; emitting inactive rollout step: %s", _compact_error(exc)
+                    )
+                    rollout_error = "browser_step_failed"
+                    step_outputs.append(
+                        await self._build_inactive_step_output(
+                            phase="step",
+                            error=exc,
+                            description=description,
+                            scalewob_info=scalewob_info,
+                            extra_info=extra_info,
+                            stable_index=stable_index,
+                            traj_uid=traj_uid,
+                            kwargs=kwargs,
+                            metrics=metrics,
+                            step_id=step_id,
+                        )
+                    )
+                    env_rewards.append(0.0)
+                    break
                 env_reward = float(step_result.get("reward", 0.0) or 0.0)
                 done = bool(step_result.get("done", False))
                 step_info = step_result.get("info", {}) or {}

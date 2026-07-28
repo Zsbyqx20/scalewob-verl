@@ -130,6 +130,7 @@ class PlaywrightScaleWoBAutomation:
         chrome_executable: str | None = None,
         window_size: tuple[int, int] = (390, 844),
         mobile_user_agent: str | None = None,
+        default_timeout_seconds: float = 10.0,
     ):
         self._env_id = env_id or "about:blank"
         self._base_url = base_url
@@ -142,6 +143,7 @@ class PlaywrightScaleWoBAutomation:
             "Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36"
         )
+        self._default_timeout_seconds = default_timeout_seconds
 
         self._executor: _DaemonSingleThreadExecutor | None = None
         self._lock = threading.Lock()
@@ -212,7 +214,12 @@ class PlaywrightScaleWoBAutomation:
             has_touch=True,
         )
         self._page = self._context.new_page()
-        self._page.set_default_timeout(5000)
+        # Playwright's per-call default timeout (covers most actions/navigations, notably
+        # NOT page.evaluate() -- see close()/_kill_process_tree() for that case). Kept in sync
+        # with ScaleWoBBrowserConfig.browser_operation_timeout_seconds, the outer timeout that
+        # wraps every call from browser.py, so a screenshot/click/etc. can't spuriously fire
+        # Playwright's own timeout before the caller's configured one ever gets a chance.
+        self._page.set_default_timeout(self._default_timeout_seconds * 1000)
 
     def close(self) -> None:
         """Close the browser, tearing down the OS process tree if the worker thread is wedged.
