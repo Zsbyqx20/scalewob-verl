@@ -232,6 +232,11 @@ class PlaywrightScaleWoBAutomation:
         Once that happens the worker thread is abandoned for good (it may still be parked
         inside Playwright's now-dead dispatcher fiber) -- safe because it's a daemon thread,
         so it can never block process shutdown.
+
+        This method must never raise: it runs from the agent loop's ``finally:`` block, and an
+        exception escaping there fails every other in-flight rollout on the same worker via
+        ``asyncio.gather()`` -- one trajectory's teardown problem should never take down the
+        whole training job.
         """
         with self._lock:
             if self._closed:
@@ -249,7 +254,10 @@ class PlaywrightScaleWoBAutomation:
                 "PlaywrightScaleWoBAutomation.close() timed out after %.1fs; force-killing browser process tree",
                 _CLOSE_TIMEOUT_SECONDS,
             )
-            self._kill_process_tree()
+            try:
+                self._kill_process_tree()
+            except Exception:
+                logger.warning("PlaywrightScaleWoBAutomation._kill_process_tree() raised", exc_info=True)
         except Exception:
             logger.warning("PlaywrightScaleWoBAutomation._close() raised", exc_info=True)
 
@@ -285,20 +293,29 @@ class PlaywrightScaleWoBAutomation:
         Safe to call from any thread, including while the dedicated worker thread is stuck
         inside a hung Playwright call -- SIGKILL-ing the underlying process immediately fails
         that pending call rather than waiting for it to return.
+
+        The driver process can exit on its own between any two of the calls below (e.g. the
+        wedged call finally unblocks and the process tears itself down); every psutil call that
+        touches it -- not just the initial ``Process()`` construction -- can therefore raise
+        ``NoSuchProcess``, so each one is guarded individually rather than relying on a single
+        surrounding try/except.
         """
         if self._driver_pid is None:
             return
         try:
             driver = psutil.Process(self._driver_pid)
+            procs = [driver, *driver.children(recursive=True)]
         except psutil.NoSuchProcess:
             return
-        procs = [driver, *driver.children(recursive=True)]
         for proc in procs:
             try:
                 proc.kill()
             except psutil.NoSuchProcess:
                 pass
-        psutil.wait_procs(procs, timeout=_CLOSE_TIMEOUT_SECONDS)
+        try:
+            psutil.wait_procs(procs, timeout=_CLOSE_TIMEOUT_SECONDS)
+        except Exception:
+            logger.warning("psutil.wait_procs() raised while force-killing browser process tree", exc_info=True)
 
     def __del__(self):
         self.close()

@@ -16,8 +16,10 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import psutil
 import pytest
 
+from verl.experimental.scalewob.browser import ScaleWoBBrowser, ScaleWoBBrowserConfig
 from verl.experimental.scalewob.playwright_backend import PlaywrightScaleWoBAutomation, _resolve_env_url
 
 _CHROME_EXECUTABLE = os.environ.get("CHROME_EXECUTABLE", "/workspace/chrome/chrome-linux64/chrome")
@@ -101,6 +103,77 @@ def test_finish_evaluation_falls_back_to_params_when_no_evaluate_task():
     result = automation._finish_evaluation(task_id="1", params=None)
 
     assert result == {"success": True, "reward": 1.0, "task_id": "1", "params": None}
+
+
+def test_kill_process_tree_swallows_process_dying_between_lookup_and_children_call(monkeypatch):
+    """Reproduces the production crash: psutil.Process(pid) succeeds, but the process exits
+    before driver.children(recursive=True) runs, so children() itself raises NoSuchProcess.
+    Only the initial Process() construction was guarded before; the children() call was not,
+    so the exception escaped _kill_process_tree() -> close() -> browser.close() and failed
+    every other in-flight rollout on the same AgentLoopWorker via asyncio.gather().
+    """
+    automation = PlaywrightScaleWoBAutomation()
+    automation._driver_pid = 999999
+
+    class _DyingProcess:
+        def children(self, recursive=True):
+            raise psutil.NoSuchProcess(999999)
+
+    monkeypatch.setattr(psutil, "Process", lambda pid: _DyingProcess())
+
+    automation._kill_process_tree()  # must not raise
+
+
+def test_kill_process_tree_swallows_wait_procs_raising(monkeypatch):
+    automation = PlaywrightScaleWoBAutomation()
+    automation._driver_pid = 999999
+
+    class _FakeProcess:
+        def children(self, recursive=True):
+            return []
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(psutil, "Process", lambda pid: _FakeProcess())
+    monkeypatch.setattr(psutil, "wait_procs", lambda procs, timeout=None: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    automation._kill_process_tree()  # must not raise
+
+
+def test_close_never_raises_even_when_kill_process_tree_raises(monkeypatch):
+    """close() runs from the agent loop's finally: block; any exception escaping it fails every
+    other in-flight rollout via asyncio.gather(). Defense in depth on top of the two tests above:
+    even if some future change makes _kill_process_tree() raise again, close() itself must not.
+    """
+    import concurrent.futures
+
+    automation = PlaywrightScaleWoBAutomation()
+
+    class _NeverResolvingExecutor:
+        def submit(self, fn, *args, **kwargs):
+            return concurrent.futures.Future()  # never resolved -> close() times out waiting on it
+
+    automation._executor = _NeverResolvingExecutor()
+    monkeypatch.setattr(automation, "_kill_process_tree", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr("verl.experimental.scalewob.playwright_backend._CLOSE_TIMEOUT_SECONDS", 0.01)
+
+    automation.close()  # must not raise
+    assert automation._closed is True
+
+
+def test_scalewob_browser_close_never_raises_when_automation_close_raises():
+    browser = ScaleWoBBrowser(ScaleWoBBrowserConfig())
+
+    class _RaisingAutomation:
+        def close(self):
+            raise RuntimeError("boom")
+
+    browser._automation = _RaisingAutomation()
+
+    browser.close()  # must not raise
+    assert browser._automation is None
+    assert browser._automation is None
 
 
 @pytest.mark.skipif(not _HAS_CHROME, reason=f"chrome executable not found at {_CHROME_EXECUTABLE}")

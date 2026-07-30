@@ -3,6 +3,8 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -11,6 +13,9 @@ from io import BytesIO
 from typing import Any
 
 from PIL import Image
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class ScaleWoBBrowserOperationTimeoutError(TimeoutError):
@@ -319,8 +324,20 @@ class ScaleWoBBrowser:
         )
 
     def close(self) -> None:
+        """Tear down the underlying automation backend.
+
+        Must never raise: this runs from the agent loop's ``finally:`` block, and an exception
+        escaping there fails every other in-flight rollout on the same worker via
+        ``asyncio.gather()`` -- one trajectory's teardown problem should never take down the
+        whole training job. The Playwright backend already makes its own ``close()`` exception-safe;
+        this guards the call generically so any backend (including the real ``scalewob`` package,
+        which is outside our control) gets the same protection.
+        """
         if self._automation is not None:
             close = getattr(self._automation, "close", None)
             if close is not None:
-                close()
+                try:
+                    close()
+                except Exception:
+                    logger.warning("ScaleWoBBrowser.close() automation.close() raised", exc_info=True)
             self._automation = None
